@@ -22,6 +22,77 @@ type OpenAICompatible struct {
 	HTTP      *http.Client
 }
 
+type OpenAIEmbedding struct {
+	Endpoint string
+	APIKey   string
+	Model    string
+	HTTP     *http.Client
+}
+
+func NewOpenAIEmbedding(endpoint, apiKey, model string) *OpenAIEmbedding {
+	return &OpenAIEmbedding{Endpoint: strings.TrimRight(endpoint, "/"), APIKey: apiKey, Model: model, HTTP: http.DefaultClient}
+}
+
+func (c *OpenAIEmbedding) Embed(ctx context.Context, inputs []string) ([][]float32, error) {
+	if c == nil || c.Endpoint == "" || c.APIKey == "" || c.Model == "" {
+		return nil, fmt.Errorf("embedding provider is not configured")
+	}
+	body, err := json.Marshal(map[string]any{"model": c.Model, "input": inputs})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Endpoint+"/embeddings", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	client := c.HTTP
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("embedding HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	var decoded struct {
+		Data []struct {
+			Index     int       `json:"index"`
+			Embedding []float32 `json:"embedding"`
+		} `json:"data"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return nil, fmt.Errorf("decode embedding response: %w", err)
+	}
+	if decoded.Error != nil {
+		return nil, fmt.Errorf("embedding provider: %s", decoded.Error.Message)
+	}
+	result := make([][]float32, len(inputs))
+	for _, item := range decoded.Data {
+		if item.Index < 0 || item.Index >= len(result) {
+			return nil, fmt.Errorf("embedding response index %d out of range", item.Index)
+		}
+		result[item.Index] = item.Embedding
+	}
+	for i := range result {
+		if len(result[i]) == 0 {
+			return nil, fmt.Errorf("embedding response missing vector %d", i)
+		}
+	}
+	return result, nil
+}
+
 func NewOpenAICompatible(endpoint, apiKey, model, promptDir string) *OpenAICompatible {
 	return &OpenAICompatible{Endpoint: strings.TrimRight(endpoint, "/"), APIKey: apiKey, Model: model, PromptDir: promptDir, HTTP: http.DefaultClient}
 }

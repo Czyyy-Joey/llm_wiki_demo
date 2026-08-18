@@ -16,6 +16,7 @@ import (
 	"unicode"
 
 	"github.com/joeychen/llm-wiki-demo/backend/internal/domain"
+	"github.com/joeychen/llm-wiki-demo/backend/internal/indexing"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/llm"
 )
 
@@ -33,6 +34,7 @@ type Service struct {
 	DB        *sql.DB
 	DataRoot  string
 	LLM       llm.LLMClient
+	Index     *indexing.Service
 	Render    func(string, []domain.WikiPage, []domain.WikiClaim, []domain.ClaimEvidence) error
 	FailAfter int // 0 disables injection; a positive value fails before that action index.
 }
@@ -138,6 +140,13 @@ func (s Service) Compile(ctx context.Context, documentID string) (Result, error)
 		return failWithPlan(ctx, s.DB, runID, planRaw, err)
 	}
 	diffRaw, _ := json.Marshal(diff)
+	if s.Index != nil {
+		if _, indexErr := s.Index.Reindex(ctx); indexErr != nil {
+			_, _ = s.DB.ExecContext(ctx, `UPDATE wiki_pages SET index_status = 'index_pending' WHERE status = 'active'`)
+		} else {
+			_, _ = s.DB.ExecContext(ctx, `UPDATE wiki_pages SET index_status = 'clean' WHERE status = 'active'`)
+		}
+	}
 	if _, err = s.DB.ExecContext(ctx, `UPDATE compilation_runs SET status = ?, apply_result_json = ?, diff_json = ? WHERE id = ?`, RunApplied, `{"applied":true}`, string(diffRaw), runID); err != nil {
 		// ApplyPlan has already committed the Wiki transaction and marked the run
 		// render_pending. Keep that recoverable state instead of reporting a
@@ -160,16 +169,24 @@ func (s Service) RetryRender(ctx context.Context, runID string) error {
 	if run.Status != RunRenderPending {
 		return fmt.Errorf("compilation run %s is not render_pending", runID)
 	}
-	pages, claims, evidence, err := s.loadWikiState(ctx)
-	if err != nil {
-		return err
-	}
 	render := s.Render
 	if render == nil {
-		render = RenderMarkdown
+		if err := s.renderDefaultProjection(ctx); err != nil {
+			return err
+		}
+	} else {
+		pages, claims, evidence, err := s.loadWikiState(ctx)
+		if err != nil {
+			return &RenderPendingError{Cause: err}
+		}
+		if err := render(s.DataRoot, pages, claims, evidence); err != nil {
+			return &RenderPendingError{Cause: err}
+		}
 	}
-	if err := render(s.DataRoot, pages, claims, evidence); err != nil {
-		return &RenderPendingError{Cause: err}
+	if s.Index != nil {
+		if _, err := s.Index.Reindex(ctx); err != nil {
+			return fmt.Errorf("rebuild retrieval indexes: %w", err)
+		}
 	}
 	_, err = s.DB.ExecContext(ctx, `UPDATE compilation_runs SET status = ?, apply_result_json = ?, error = NULL WHERE id = ?`, RunApplied, `{"applied":true,"rendered":true}`, runID)
 	return err
@@ -470,14 +487,17 @@ func (s Service) ApplyPlan(ctx context.Context, runID string, plan domain.Compil
 	}
 	render := s.Render
 	if render == nil {
-		render = RenderMarkdown
-	}
-	pages, claims, evidence, err := s.loadWikiState(ctx)
-	if err != nil {
-		return diff, &RenderPendingError{Cause: err}
-	}
-	if err = render(s.DataRoot, pages, claims, evidence); err != nil {
-		return diff, &RenderPendingError{Cause: err}
+		if err := s.renderDefaultProjection(ctx); err != nil {
+			return diff, err
+		}
+	} else {
+		pages, claims, evidence, err := s.loadWikiState(ctx)
+		if err != nil {
+			return diff, &RenderPendingError{Cause: err}
+		}
+		if err = render(s.DataRoot, pages, claims, evidence); err != nil {
+			return diff, &RenderPendingError{Cause: err}
+		}
 	}
 	return diff, nil
 }
@@ -699,6 +719,21 @@ func validateAnalysis(analysis domain.SourceAnalysis, chunks []domain.SourceChun
 	return nil
 }
 
+func (s Service) renderDefaultProjection(ctx context.Context) error {
+	pages, claims, evidence, err := s.loadWikiState(ctx)
+	if err != nil {
+		return &RenderPendingError{Cause: err}
+	}
+	links, err := s.loadWikiLinks(ctx)
+	if err != nil {
+		return &RenderPendingError{Cause: err}
+	}
+	if err := RenderMarkdownWithLinks(s.DataRoot, pages, claims, evidence, links); err != nil {
+		return &RenderPendingError{Cause: err}
+	}
+	return nil
+}
+
 func validRelation(value string) bool {
 	switch value {
 	case "related_to", "part_of", "depends_on", "contradicts", "supports", "references":
@@ -756,7 +791,7 @@ func (s Service) loadChunks(ctx context.Context, id string) ([]domain.SourceChun
 }
 
 func (s Service) loadWikiState(ctx context.Context) ([]domain.WikiPage, []domain.WikiClaim, []domain.ClaimEvidence, error) {
-	pageRows, err := s.DB.QueryContext(ctx, `SELECT id, slug, page_type, title, summary, status, current_revision, created_at, updated_at FROM wiki_pages ORDER BY slug`)
+	pageRows, err := s.DB.QueryContext(ctx, `SELECT id, slug, page_type, title, summary, status, current_revision, created_at, updated_at FROM wiki_pages WHERE status = 'active' ORDER BY slug`)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -775,7 +810,7 @@ func (s Service) loadWikiState(ctx context.Context) ([]domain.WikiPage, []domain
 	if err := pageRows.Err(); err != nil {
 		return nil, nil, nil, err
 	}
-	claimRows, err := s.DB.QueryContext(ctx, `SELECT id, page_id, COALESCE(section_id, ''), text, claim_type, status, created_by_run_id, updated_by_run_id FROM wiki_claims ORDER BY page_id, id`)
+	claimRows, err := s.DB.QueryContext(ctx, `SELECT c.id, c.page_id, COALESCE(c.section_id, ''), c.text, c.claim_type, c.status, c.created_by_run_id, c.updated_by_run_id FROM wiki_claims c JOIN wiki_pages p ON p.id = c.page_id WHERE p.status = 'active' ORDER BY c.page_id, c.id`)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -788,7 +823,7 @@ func (s Service) loadWikiState(ctx context.Context) ([]domain.WikiPage, []domain
 		}
 		claims = append(claims, claim)
 	}
-	evidenceRows, err := s.DB.QueryContext(ctx, `SELECT claim_id, source_chunk_id, relation, COALESCE(note, '') FROM claim_evidence ORDER BY claim_id, source_chunk_id`)
+	evidenceRows, err := s.DB.QueryContext(ctx, `SELECT ce.claim_id, ce.source_chunk_id, ce.relation, COALESCE(ce.note, '') FROM claim_evidence ce JOIN wiki_claims c ON c.id = ce.claim_id JOIN wiki_pages p ON p.id = c.page_id WHERE p.status = 'active' ORDER BY ce.claim_id, ce.source_chunk_id`)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -804,7 +839,28 @@ func (s Service) loadWikiState(ctx context.Context) ([]domain.WikiPage, []domain
 	return pages, claims, evidence, evidenceRows.Err()
 }
 
+func (s Service) loadWikiLinks(ctx context.Context) ([]domain.WikiLink, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT l.source_page_id, l.target_page_id, l.relation, l.created_by_run_id FROM wiki_links l JOIN wiki_pages sp ON sp.id = l.source_page_id AND sp.status = 'active' JOIN wiki_pages tp ON tp.id = l.target_page_id AND tp.status = 'active' ORDER BY l.source_page_id, l.target_page_id, l.relation`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	links := make([]domain.WikiLink, 0)
+	for rows.Next() {
+		var link domain.WikiLink
+		if err := rows.Scan(&link.SourcePageID, &link.TargetPageID, &link.Relation, &link.CreatedByRunID); err != nil {
+			return nil, err
+		}
+		links = append(links, link)
+	}
+	return links, rows.Err()
+}
+
 func RenderMarkdown(dataRoot string, pages []domain.WikiPage, claims []domain.WikiClaim, evidence []domain.ClaimEvidence) error {
+	return RenderMarkdownWithLinks(dataRoot, pages, claims, evidence, nil)
+}
+
+func RenderMarkdownWithLinks(dataRoot string, pages []domain.WikiPage, claims []domain.WikiClaim, evidence []domain.ClaimEvidence, links []domain.WikiLink) error {
 	if err := os.MkdirAll(dataRoot, 0o755); err != nil {
 		return err
 	}
@@ -813,7 +869,7 @@ func RenderMarkdown(dataRoot string, pages []domain.WikiPage, claims []domain.Wi
 		return err
 	}
 	defer os.RemoveAll(staging)
-	if err := renderMarkdownFiles(staging, pages, claims, evidence); err != nil {
+	if err := renderMarkdownFiles(staging, pages, claims, evidence, links); err != nil {
 		return err
 	}
 
@@ -834,9 +890,30 @@ func RenderMarkdown(dataRoot string, pages []domain.WikiPage, claims []domain.Wi
 	return os.Rename(staging, target)
 }
 
-func renderMarkdownFiles(outputDir string, pages []domain.WikiPage, claims []domain.WikiClaim, evidence []domain.ClaimEvidence) error {
+func renderMarkdownFiles(outputDir string, pages []domain.WikiPage, claims []domain.WikiClaim, evidence []domain.ClaimEvidence, links []domain.WikiLink) error {
+	activePages := pages[:0]
+	for _, page := range pages {
+		if page.Status == domain.PageStatusActive {
+			activePages = append(activePages, page)
+		}
+	}
+	pages = activePages
 	claimByPage := map[string][]domain.WikiClaim{}
 	evidenceByClaim := map[string][]domain.ClaimEvidence{}
+	pageByID := map[string]domain.WikiPage{}
+	linksBySource := map[string][]domain.WikiLink{}
+	for _, page := range pages {
+		pageByID[page.ID] = page
+	}
+	for _, link := range links {
+		if _, sourceActive := pageByID[link.SourcePageID]; !sourceActive {
+			continue
+		}
+		if _, targetActive := pageByID[link.TargetPageID]; !targetActive {
+			continue
+		}
+		linksBySource[link.SourcePageID] = append(linksBySource[link.SourcePageID], link)
+	}
 	for _, claim := range claims {
 		claimByPage[claim.PageID] = append(claimByPage[claim.PageID], claim)
 	}
@@ -844,6 +921,23 @@ func renderMarkdownFiles(outputDir string, pages []domain.WikiPage, claims []dom
 		evidenceByClaim[item.ClaimID] = append(evidenceByClaim[item.ClaimID], item)
 	}
 	sort.Slice(pages, func(i, j int) bool { return pages[i].Slug < pages[j].Slug })
+	for _, pageType := range []domain.PageType{domain.PageTypeConcept, domain.PageTypeEntity, domain.PageTypeTopic} {
+		if err := os.MkdirAll(filepath.Join(outputDir, string(pageType)+"s"), 0o755); err != nil {
+			return err
+		}
+	}
+	var index strings.Builder
+	index.WriteString("# Compiled Wiki\n\n")
+	index.WriteString("Deterministic index of compiled knowledge pages.\n\n")
+	for _, page := range pages {
+		if !validRenderSlug(page.Slug) {
+			return fmt.Errorf("refuse to render wiki page with unsafe slug %q", page.Slug)
+		}
+		fmt.Fprintf(&index, "- [%s](%ss/%s.md)\n", page.Title, page.PageType, page.Slug)
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, "index.md"), []byte(index.String()), 0o644); err != nil {
+		return err
+	}
 	for _, page := range pages {
 		if !validRenderSlug(page.Slug) {
 			return fmt.Errorf("refuse to render wiki page with unsafe slug %q", page.Slug)
@@ -863,10 +957,29 @@ func renderMarkdownFiles(outputDir string, pages []domain.WikiPage, claims []dom
 				fmt.Fprintf(&b, " [%s:%s]", citation.Relation, citation.SourceChunkID)
 			}
 		}
+		if related := linksBySource[page.ID]; len(related) > 0 {
+			sort.Slice(related, func(i, j int) bool {
+				left, right := pageByID[related[i].TargetPageID], pageByID[related[j].TargetPageID]
+				if left.Slug != right.Slug {
+					return left.Slug < right.Slug
+				}
+				return related[i].Relation < related[j].Relation
+			})
+			b.WriteString("\n\n## Related Pages\n")
+			for _, link := range related {
+				target := pageByID[link.TargetPageID]
+				fmt.Fprintf(&b, "\n- [[%s]] (`%s`)", target.Slug, link.Relation)
+			}
+		}
 		b.WriteString("\n")
-		path := filepath.Join(outputDir, page.Slug+".md")
-		if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
-			return err
+		content := []byte(b.String())
+		for _, path := range []string{
+			filepath.Join(outputDir, page.Slug+".md"),
+			filepath.Join(outputDir, string(page.PageType)+"s", page.Slug+".md"),
+		} {
+			if err := os.WriteFile(path, content, 0o644); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

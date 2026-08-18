@@ -31,6 +31,26 @@ type EmbeddingClient interface {
 	Embed(context.Context, []string) ([][]float32, error)
 }
 
+type DeterministicEmbedding struct{}
+
+func (DeterministicEmbedding) Embed(_ context.Context, inputs []string) ([][]float32, error) {
+	const dimensions = 64
+	result := make([][]float32, len(inputs))
+	for i, input := range inputs {
+		vector := make([]float32, dimensions)
+		for _, token := range strings.Fields(strings.ToLower(input)) {
+			var hash uint32 = 2166136261
+			for _, r := range token {
+				hash ^= uint32(r)
+				hash *= 16777619
+			}
+			vector[int(hash%dimensions)] += 1
+		}
+		result[i] = vector
+	}
+	return result, nil
+}
+
 type DeterministicFake struct{}
 
 func (DeterministicFake) Name() string { return "deterministic-fake" }

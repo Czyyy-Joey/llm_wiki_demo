@@ -1,0 +1,4 @@
+./contracts.go
+./openai.go
+./contracts_test.go
+./embedding_test.go

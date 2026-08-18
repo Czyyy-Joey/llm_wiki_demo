@@ -1,0 +1,16 @@
+=== RUN   TestHybridRetrievalReindexExpansionAndRebuild
+2026/08/18 14:52:21 OK   001_initial.sql (1.18ms)
+2026/08/18 14:52:21 OK   002_drop_schema_migrations_contract.sql (82.88µs)
+2026/08/18 14:52:21 OK   003_source_parse_error.sql (225µs)
+2026/08/18 14:52:21 OK   004_retrieval_indexes.sql (766.54µs)
+2026/08/18 14:52:21 goose: successfully migrated database to version: 4
+--- PASS: TestHybridRetrievalReindexExpansionAndRebuild (0.01s)
+=== RUN   TestChineseWikiMatchingTokensReachFTS
+2026/08/18 14:52:21 OK   001_initial.sql (775.96µs)
+2026/08/18 14:52:21 OK   002_drop_schema_migrations_contract.sql (67.96µs)
+2026/08/18 14:52:21 OK   003_source_parse_error.sql (183.21µs)
+2026/08/18 14:52:21 OK   004_retrieval_indexes.sql (588.79µs)
+2026/08/18 14:52:21 goose: successfully migrated database to version: 4
+--- PASS: TestChineseWikiMatchingTokensReachFTS (0.00s)
+PASS
+ok  	github.com/joeychen/llm-wiki-demo/backend/internal/retrieval	0.448s

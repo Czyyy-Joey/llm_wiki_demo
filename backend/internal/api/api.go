@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"strconv"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humachi"
@@ -18,14 +19,20 @@ import (
 	"github.com/joeychen/llm-wiki-demo/backend/internal/compiler"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/config"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/domain"
+	"github.com/joeychen/llm-wiki-demo/backend/internal/indexing"
+	"github.com/joeychen/llm-wiki-demo/backend/internal/retrieval"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/sources"
+	"github.com/joeychen/llm-wiki-demo/backend/internal/wiki"
 )
 
 type Server struct {
-	DB       *sql.DB
-	Config   config.Config
-	Sources  sources.Service
-	Compiler compiler.Service
+	DB        *sql.DB
+	Config    config.Config
+	Sources   sources.Service
+	Compiler  compiler.Service
+	Wiki      wiki.Service
+	Indexer   indexing.Service
+	Retriever retrieval.Service
 }
 type HealthResponse struct {
 	Body struct {
@@ -62,10 +69,56 @@ func (s *Server) Router() http.Handler {
 	r.Get("/api/sources", s.listSources)
 	r.Get("/api/sources/{id}", s.getSource)
 	r.Get("/api/sources/{id}/chunks", s.getSourceChunks)
+	r.Get("/api/sources/{id}/wiki", s.getSourceWiki)
+	r.Get("/api/wiki/pages", s.listWikiPages)
+	r.Get("/api/wiki/pages/{key}", s.getWikiPage)
+	r.Get("/api/wiki/pages/{key}/revisions", s.getWikiRevisions)
+	r.Get("/api/wiki/pages/{key}/revisions/{revision}", s.getWikiRevisionDiff)
+	r.Get("/api/wiki/lint", s.lintWiki)
 	r.Post("/api/compilations", s.createCompilation)
 	r.Get("/api/compilations/{id}", s.getCompilation)
 	r.Post("/api/compilations/{id}/render", s.retryCompilationRender)
+	r.Post("/api/indexes/reindex", s.reindex)
+	r.Get("/api/retrieval/search", s.search)
+	r.Get("/api/retrieval/traces/{id}", s.getRetrievalTrace)
 	return requestID(r)
+}
+
+func (s *Server) reindex(w http.ResponseWriter, r *http.Request) {
+	result, err := s.Indexer.Reindex(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) search(w http.ResponseWriter, r *http.Request) {
+	result, err := s.Retriever.Search(r.Context(), r.URL.Query().Get("q"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) getRetrievalTrace(w http.ResponseWriter, r *http.Request) {
+	var trace domain.RetrievalTrace
+	var raw string
+	err := s.DB.QueryRowContext(r.Context(), `SELECT trace_json FROM retrieval_traces WHERE id = ?`, chi.URLParam(r, "id")).Scan(&raw)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusNotFound, fmt.Errorf("retrieval trace not found"))
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := json.Unmarshal([]byte(raw), &trace); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, trace)
 }
 
 type compilationRequest struct {
@@ -172,6 +225,75 @@ func (s *Server) getSourceChunks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"chunks": result})
+}
+func (s *Server) getSourceWiki(w http.ResponseWriter, r *http.Request) {
+	result, err := s.Wiki.SourceTrace(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusNotFound, fmt.Errorf("source not found"))
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+func (s *Server) listWikiPages(w http.ResponseWriter, r *http.Request) {
+	result, err := s.Wiki.ListPages(r.Context(), r.URL.Query().Get("type"))
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"pages": result})
+}
+func (s *Server) getWikiPage(w http.ResponseWriter, r *http.Request) {
+	result, err := s.Wiki.GetPage(r.Context(), chi.URLParam(r, "key"))
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusNotFound, fmt.Errorf("wiki page not found"))
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+func (s *Server) getWikiRevisions(w http.ResponseWriter, r *http.Request) {
+	result, err := s.Wiki.Revisions(r.Context(), chi.URLParam(r, "key"))
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusNotFound, fmt.Errorf("wiki page not found"))
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"revisions": result})
+}
+func (s *Server) getWikiRevisionDiff(w http.ResponseWriter, r *http.Request) {
+	revision, err := strconv.Atoi(chi.URLParam(r, "revision"))
+	if err != nil || revision < 1 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("revision must be a positive integer"))
+		return
+	}
+	result, err := s.Wiki.Diff(r.Context(), chi.URLParam(r, "key"), revision)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusNotFound, fmt.Errorf("revision not found"))
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+func (s *Server) lintWiki(w http.ResponseWriter, r *http.Request) {
+	issues, err := s.Wiki.Lint(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"issues": issues, "valid": len(issues) == 0})
 }
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")

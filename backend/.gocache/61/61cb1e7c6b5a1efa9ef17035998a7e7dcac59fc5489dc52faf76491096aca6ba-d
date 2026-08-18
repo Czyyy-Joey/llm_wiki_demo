@@ -1,0 +1,9 @@
+# test log
+getenv GOTMPDIR
+getenv TMPDIR
+stat /var/folders/98/hlhl36957j17l7r30rk_b6jr0000gn/T/TestHybridRetrievalReindexExpansionAndRebuild3556718987/001
+open /var/folders/98/hlhl36957j17l7r30rk_b6jr0000gn/T
+getenv GOTMPDIR
+getenv TMPDIR
+stat /var/folders/98/hlhl36957j17l7r30rk_b6jr0000gn/T/TestChineseWikiMatchingTokensReachFTS1848092083/001
+open /var/folders/98/hlhl36957j17l7r30rk_b6jr0000gn/T

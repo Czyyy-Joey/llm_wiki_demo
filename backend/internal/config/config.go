@@ -19,6 +19,7 @@ type Config struct {
 	CompilerPromptDir    string
 	CompilerFakeFallback bool
 	EmbeddingEndpoint    string
+	IndexDir             string
 }
 
 type Provider struct {
@@ -47,6 +48,7 @@ func Load() Config {
 		CompilerPromptDir:    env("COMPILER_PROMPT_DIR", "prompts"),
 		CompilerFakeFallback: envBool("COMPILER_LLM_FAKE_FALLBACK", false),
 		EmbeddingEndpoint:    os.Getenv("EMBEDDING_ENDPOINT"),
+		IndexDir:             env("INDEX_DIR", "../data/indexes"),
 	}
 }
 

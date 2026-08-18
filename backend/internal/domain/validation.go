@@ -94,6 +94,11 @@ func (t RetrievalTrace) Validate() error {
 	if t.ID == "" || t.NormalizedQuery == "" {
 		return fmt.Errorf("retrieval trace requires id and normalized_query")
 	}
+	for _, candidate := range t.Candidates {
+		if candidate.PageID == "" || candidate.PassageID == "" {
+			return fmt.Errorf("retrieval trace candidate requires page_id and passage_id")
+		}
+	}
 	return nil
 }
 

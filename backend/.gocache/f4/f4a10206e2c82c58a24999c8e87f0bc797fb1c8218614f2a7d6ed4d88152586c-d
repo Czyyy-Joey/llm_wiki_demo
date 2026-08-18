@@ -1,0 +1,11 @@
+./collection.go
+./db.go
+./document.go
+./embed_cohere.go
+./embed_compat.go
+./embed_ollama.go
+./embed_openai.go
+./embed_vertex.go
+./persistence.go
+./query.go
+./vector.go

@@ -74,6 +74,7 @@ type WikiPage struct {
 	CurrentRevision int        `json:"current_revision"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
+	IndexStatus     string     `json:"index_status,omitempty"`
 }
 type WikiSection struct {
 	ID       string `json:"id"`
@@ -172,12 +173,34 @@ type CompilationCandidate struct {
 	ClaimTexts []string `json:"claim_texts"`
 }
 type RetrievalTrace struct {
-	ID               string             `json:"id"`
-	NormalizedQuery  string             `json:"normalized_query"`
-	FTSCandidates    []string           `json:"fts_candidates"`
-	VectorCandidates []string           `json:"vector_candidates"`
-	RRFScore         map[string]float64 `json:"rrf_score"`
-	ExpandedPages    []string           `json:"expanded_pages"`
+	ID                string                    `json:"id"`
+	NormalizedQuery   string                    `json:"normalized_query"`
+	FTSCandidates     []string                  `json:"fts_candidates"`
+	VectorCandidates  []string                  `json:"vector_candidates"`
+	RRFScore          map[string]float64        `json:"rrf_score"`
+	ExpandedPages     []string                  `json:"expanded_pages"`
+	FinalCandidates   []string                  `json:"final_candidates,omitempty"`
+	DroppedCandidates []string                  `json:"dropped_candidates,omitempty"`
+	ContextIDs        []string                  `json:"context_ids,omitempty"`
+	ContextBudget     int                       `json:"context_budget"`
+	ContextUsed       int                       `json:"context_used"`
+	Candidates        []RetrievalCandidateTrace `json:"candidates,omitempty"`
+	SourceFallback    []string                  `json:"source_fallback,omitempty"`
+	Notes             []string                  `json:"notes,omitempty"`
+}
+type RetrievalCandidateTrace struct {
+	PageID          string   `json:"page_id"`
+	PassageID       string   `json:"passage_id"`
+	FTSScore        float64  `json:"fts_score"`
+	VectorScore     float64  `json:"vector_score"`
+	RRFScore        float64  `json:"rrf_score"`
+	ExpansionScore  float64  `json:"expansion_score"`
+	FinalScore      float64  `json:"final_score"`
+	Expanded        bool     `json:"expanded"`
+	ExpansionFrom   []string `json:"expansion_from,omitempty"`
+	Selected        bool     `json:"selected"`
+	SelectionReason string   `json:"selection_reason,omitempty"`
+	DiscardReason   string   `json:"discard_reason,omitempty"`
 }
 type Conversation struct {
 	ID        string    `json:"id"`

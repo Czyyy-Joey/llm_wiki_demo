@@ -1,0 +1,13 @@
+./api.go
+./autoconfig.go
+./chain.go
+./cookie.go
+./defaults.go
+./error.go
+./formdata.go
+./huma.go
+./openapi.go
+./registry.go
+./schema.go
+./transforms.go
+./validate.go
