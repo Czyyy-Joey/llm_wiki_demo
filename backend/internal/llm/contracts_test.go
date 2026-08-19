@@ -151,6 +151,48 @@ func TestOpenAICompatibleUsesStrictStructuredOutput(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatibleFallsBackToJSONObjectWhenSchemaUnsupported(t *testing.T) {
+	var calls int
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		var request struct {
+			Messages []chatMessage  `json:"messages"`
+			Format   responseFormat `json:"response_format"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if calls == 1 {
+			if request.Format.Type != "json_schema" || request.Format.JSONSchema == nil || !request.Format.JSONSchema.Strict {
+				t.Fatalf("first response_format = %#v", request.Format)
+			}
+			return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(`{"error":{"message":"response_format json_schema is unsupported"}}`)), Request: r}, nil
+		}
+		if request.Format.Type != "json_object" || request.Format.JSONSchema != nil {
+			t.Fatalf("fallback response_format = %#v", request.Format)
+		}
+		if len(request.Messages) == 0 || !strings.Contains(request.Messages[0].Content, "strictly matches this JSON Schema") {
+			t.Fatalf("fallback system prompt = %#v", request.Messages)
+		}
+		content := `{"document_id":"doc_1","summary":"summary","topics":[],"relations":[]}`
+		body := `{"choices":[{"message":{"content":` + strconv.Quote(content) + `}}]}`
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+	})
+
+	client := NewOpenAICompatible("https://oneapi.example/v1", "secret", "model", "")
+	client.HTTP = &http.Client{Transport: transport}
+	raw, err := client.Analyze(context.Background(), AnalyzeInput{Document: domain.SourceDocument{ID: "doc_1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeStrict[domain.SourceAnalysis](raw); err != nil {
+		t.Fatalf("strict decode after fallback: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

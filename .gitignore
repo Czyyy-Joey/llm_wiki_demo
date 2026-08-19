@@ -1,5 +1,6 @@
 .env
 backend/server
+backend/.gocache/
 data/*.db
 data/*.db-*
 frontend/dist/

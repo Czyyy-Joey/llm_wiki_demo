@@ -200,16 +200,43 @@ func failWithPlan(ctx context.Context, db *sql.DB, runID string, plan json.RawMe
 
 func (s Service) GetRun(ctx context.Context, id string) (Run, error) {
 	var run Run
-	var created, analyze, candidates, plan, validation, applyResult, diff, model, prompt, runError sql.NullString
-	err := s.DB.QueryRowContext(ctx, `SELECT id, document_id, status, analyze_json, candidates_json, plan_json, validation_json, apply_result_json, diff_json, model, prompt_version, error, created_at FROM compilation_runs WHERE id = ?`, id).Scan(&run.ID, &run.DocumentID, &run.Status, &analyze, &candidates, &plan, &validation, &applyResult, &diff, &model, &prompt, &runError, &created)
+	err := scanRun(s.DB.QueryRowContext(ctx, `SELECT id, document_id, status, analyze_json, candidates_json, plan_json, validation_json, apply_result_json, diff_json, model, prompt_version, error, created_at FROM compilation_runs WHERE id = ?`, id), &run)
+	return run, err
+}
+
+func (s Service) ListRuns(ctx context.Context, limit int) ([]Run, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, document_id, status, analyze_json, candidates_json, plan_json, validation_json, apply_result_json, diff_json, model, prompt_version, error, created_at FROM compilation_runs ORDER BY created_at DESC, id DESC LIMIT ?`, limit)
 	if err != nil {
-		return run, err
+		return nil, err
+	}
+	defer rows.Close()
+	result := []Run{}
+	for rows.Next() {
+		var run Run
+		if err := scanRun(rows, &run); err != nil {
+			return nil, err
+		}
+		result = append(result, run)
+	}
+	return result, rows.Err()
+}
+
+type runScanner interface{ Scan(...any) error }
+
+func scanRun(row runScanner, run *Run) error {
+	var created, analyze, candidates, plan, validation, applyResult, diff, model, prompt, runError sql.NullString
+	err := row.Scan(&run.ID, &run.DocumentID, &run.Status, &analyze, &candidates, &plan, &validation, &applyResult, &diff, &model, &prompt, &runError, &created)
+	if err != nil {
+		return err
 	}
 	run.Analyze, run.Candidates, run.Plan = rawOrNil(analyze), rawOrNil(candidates), rawOrNil(plan)
 	run.Validation, run.ApplyResult, run.Diff = rawOrNil(validation), rawOrNil(applyResult), rawOrNil(diff)
 	run.Model, run.PromptVersion, run.Error = model.String, prompt.String, runError.String
 	run.CreatedAt, err = time.Parse(time.RFC3339Nano, created.String)
-	return run, err
+	return err
 }
 
 func rawOrNil(value sql.NullString) json.RawMessage {

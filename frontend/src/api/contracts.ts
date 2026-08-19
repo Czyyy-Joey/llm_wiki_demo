@@ -1,5 +1,10 @@
 export type ProviderStatus = { configured: boolean; endpoint_configured: boolean; model?: string }
-export type HealthResponse = { status: string; database: string; providers: { compiler_llm: ProviderStatus; embedding: ProviderStatus } }
+export type HealthResponse = { status: string; database: string; providers: { compiler_llm: ProviderStatus; chat_llm: ProviderStatus; embedding: ProviderStatus } }
+export type LLMSettings = { base_url: string; model: string; api_key_set: boolean; fake_fallback?: boolean }
+export type EmbeddingSettings = { base_url: string; model: string; batch_size?: number }
+export type Settings = { llm: LLMSettings; embedding: EmbeddingSettings }
+export type ConfigStatus = { providers: HealthResponse['providers']; settings: Settings }
+export type SettingsInput = { llm: { base_url: string; model: string; api_key: string; fake_fallback: boolean }; embedding: { base_url: string; model: string; batch_size: number } }
 export type PageType = 'concept' | 'entity' | 'topic'
 export type WikiPage = { id: string; slug: string; page_type: PageType; title: string; summary: string; status: string; current_revision: number; updated_at: string }
 export type WikiPageListItem = WikiPage & { claim_count: number; source_count: number; link_count: number }
@@ -17,6 +22,17 @@ export type RetrievalCandidate = { passage_id: string; page_id: string; slug: st
 export type RetrievalTrace = { id: string; normalized_query: string; fts_candidates: string[]; vector_candidates: string[]; rrf_score: Record<string, number>; expanded_pages: string[]; final_candidates?: string[]; dropped_candidates?: string[]; context_ids?: string[]; context_budget: number; context_used: number; notes?: string[] }
 export type RetrievalContext = { id: string; kind: string; page_id?: string; passage_id?: string; source_chunk_id?: string; text: string; citation: string }
 export type RetrievalResult = { query: string; candidates: RetrievalCandidate[]; context: RetrievalContext[]; trace: RetrievalTrace }
+export type CitationSnapshot = { id: string; kind: string; page_id?: string; passage_id?: string; source_chunk_id?: string; label: string; text: string }
+export type QueryResult = { question: string; answer: string; citations: CitationSnapshot[]; wiki_references: CitationSnapshot[]; context: CitationSnapshot[]; retrieval_trace: RetrievalTrace }
+export type Conversation = { id: string; title: string; created_at: string; updated_at: string }
+export type Message = { id: string; conversation_id: string; role: string; content: string; retrieval_trace_id?: string; standalone_query?: string; citations?: CitationSnapshot[]; context?: CitationSnapshot[]; created_at: string }
+export type ConversationDetail = { conversation: Conversation; messages: Message[] }
+export type ChatTurnResult = { user_message: Message; assistant_message: Message; result: QueryResult }
+export type SourceUpload = { source: SourceDocument; chunks: SourceChunk[]; result: { action: 'CREATED' | 'NO_OP' } }
+export type SourceChunkDetail = { source: SourceDocument; chunk: SourceChunk }
+export type SourceWikiTrace = { source: SourceDocument; chunk_count: number; claim_count: number; evidence: EvidenceView[] }
+export type CompilationPlan = { document_id: string; page_actions: Array<{ action: string; target_page_id?: string; source_page_id?: string; slug?: string; page_type?: string; title?: string; reason: string; claim_actions?: Array<{ action: string; text: string; evidence_chunk_ids: string[] }> }> }
+export type CompilationRun = { id: string; document_id: string; status: string; analyze?: { summary?: string; topics?: Array<{ key: string; title: string; page_type: string; claims: unknown[] }> }; candidates?: Array<{ topic_key: string; page_id: string; title: string; score: number }>; plan?: CompilationPlan; validation?: { valid: boolean; error?: string }; apply_result?: Record<string, unknown>; diff?: { pages?: Array<Record<string, unknown>>; added_claims?: string[]; changed_claims?: string[]; removed_claims?: string[] } | Record<string, unknown>; model?: string; prompt_version?: string; error?: string; created_at: string }
 
 async function getJSON<T>(path: string): Promise<T> {
   const response = await fetch(path)
@@ -24,9 +40,53 @@ async function getJSON<T>(path: string): Promise<T> {
   return await response.json() as T
 }
 
+async function sendJSON<T>(path: string, method: string, body: unknown): Promise<T> {
+  const response = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as { error?: string } | null
+    throw new Error(payload?.error || `Request failed: ${response.status}`)
+  }
+  return await response.json() as T
+}
+
 export async function getHealth(): Promise<HealthResponse> {
   return getJSON<HealthResponse>('/api/health')
 }
+
+export function getConfig(): Promise<ConfigStatus> { return getJSON('/api/config/status') }
+export function saveSettings(value: SettingsInput): Promise<ConfigStatus & { reindex_required: boolean }> { return sendJSON('/api/config/settings', 'PUT', value) }
+export function reindex(): Promise<{ wiki_passages: number; source_chunks: number; embeddings_made: number }> { return postJSON('/api/indexes/reindex', {}) }
+
+export async function getSources(): Promise<SourceDocument[]> {
+  const response = await getJSON<{ sources: SourceDocument[] }>('/api/sources')
+  return response.sources ?? []
+}
+
+export async function uploadSource(file: File): Promise<SourceUpload> {
+  const body = new FormData()
+  body.append('file', file)
+  const response = await fetch('/api/sources', { method: 'POST', body })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as { error?: string } | null
+    throw new Error(payload?.error || `Upload failed: ${response.status}`)
+  }
+  return await response.json() as SourceUpload
+}
+
+export async function getSourceChunks(id: string): Promise<SourceChunk[]> {
+  const response = await getJSON<{ chunks: SourceChunk[] }>(`/api/sources/${encodeURIComponent(id)}/chunks`)
+  return response.chunks ?? []
+}
+export function getSourceChunk(id: string): Promise<SourceChunkDetail> { return getJSON(`/api/source-chunks/${encodeURIComponent(id)}`) }
+export function getSourceWiki(id: string): Promise<SourceWikiTrace> { return getJSON(`/api/sources/${encodeURIComponent(id)}/wiki`) }
+
+export async function getCompilations(): Promise<CompilationRun[]> {
+  const response = await getJSON<{ compilations: CompilationRun[] }>('/api/compilations')
+  return response.compilations
+}
+export function getCompilation(id: string): Promise<CompilationRun> { return getJSON(`/api/compilations/${encodeURIComponent(id)}`) }
+export function compileSource(documentID: string): Promise<{ run_id: string; status: string }> { return postJSON('/api/compilations', { document_id: documentID }) }
+export function retryCompilationRender(id: string): Promise<CompilationRun> { return postJSON(`/api/compilations/${encodeURIComponent(id)}/render`, {}) }
 
 export async function getWikiPages(pageType?: PageType): Promise<WikiPageListItem[]> {
   const query = pageType ? `?type=${pageType}` : ''
@@ -45,4 +105,64 @@ export async function getWikiRevisions(slug: string): Promise<RevisionView[]> {
 
 export function searchWiki(query: string): Promise<RetrievalResult> {
   return getJSON<RetrievalResult>(`/api/retrieval/search?q=${encodeURIComponent(query)}`)
+}
+
+export function askQuestion(question: string): Promise<QueryResult> {
+  return postJSON<QueryResult>('/api/query', { question })
+}
+
+export function createConversation(title = ''): Promise<Conversation> {
+  return postJSON<Conversation>('/api/conversations', { title })
+}
+
+export async function getConversations(): Promise<Conversation[]> {
+  const response = await getJSON<{ conversations: Conversation[] }>('/api/conversations')
+  return response.conversations
+}
+
+export async function getConversation(id: string): Promise<ConversationDetail> {
+  return getJSON<ConversationDetail>(`/api/conversations/${encodeURIComponent(id)}`)
+}
+
+export function sendMessage(id: string, question: string): Promise<ChatTurnResult> {
+  return postJSON(`/api/conversations/${encodeURIComponent(id)}/messages`, { question })
+}
+
+export async function streamMessage(id: string, question: string, onDelta: (delta: string) => void): Promise<ChatTurnResult> {
+  const response = await fetch(`/api/conversations/${encodeURIComponent(id)}/messages/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify({ question }),
+  })
+  if (!response.ok || !response.body) throw new Error(`Request failed: ${response.status}`)
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let completed: ChatTurnResult | undefined
+  const consume = (block: string) => {
+    const event = block.split('\n').find(line => line.startsWith('event:'))?.slice(6).trim()
+    const data = block.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n')
+    if (!event || !data) return
+    const payload = JSON.parse(data) as { delta?: string; error?: string } | ChatTurnResult
+    if (event === 'message' && 'delta' in payload && payload.delta) onDelta(payload.delta)
+    if (event === 'done') completed = payload as ChatTurnResult
+    if (event === 'error') throw new Error('error' in payload ? payload.error : 'Stream failed')
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    buffer += decoder.decode(value, { stream: !done })
+    const blocks = buffer.split('\n\n')
+    buffer = blocks.pop() ?? ''
+    blocks.forEach(consume)
+    if (done) break
+  }
+  if (buffer.trim()) consume(buffer)
+  if (!completed) throw new Error('Stream ended before completion')
+  return completed
+}
+
+async function postJSON<T>(path: string, body: unknown): Promise<T> {
+	return sendJSON(path, 'POST', body)
 }

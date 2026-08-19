@@ -39,6 +39,11 @@ type IngestResult struct {
 	NoOp     bool
 }
 
+type ChunkDetail struct {
+	Chunk  domain.SourceChunk    `json:"chunk"`
+	Source domain.SourceDocument `json:"source"`
+}
+
 func (s Service) Ingest(ctx context.Context, input IngestInput) (IngestResult, error) {
 	if strings.TrimSpace(input.OriginalName) == "" {
 		return IngestResult{}, fmt.Errorf("original_name is required")
@@ -185,6 +190,26 @@ func (s Service) Chunks(ctx context.Context, documentID string) ([]domain.Source
 		result = append(result, item)
 	}
 	return result, rows.Err()
+}
+
+func (s Service) Chunk(ctx context.Context, id string) (ChunkDetail, error) {
+	var result ChunkDetail
+	var page sql.NullInt64
+	var heading, created string
+	err := s.DB.QueryRowContext(ctx, `SELECT c.id, c.document_id, c.chunk_index, c.text, c.page_number, c.heading_path, c.char_start, c.char_end, c.content_hash, d.id, d.original_name, d.media_type, d.sha256, d.original_path, COALESCE(d.parsed_path, ''), d.status, d.parser_version, d.created_at, COALESCE(d.parse_error, '') FROM source_chunks c JOIN source_documents d ON d.id = c.document_id WHERE c.id = ?`, id).Scan(
+		&result.Chunk.ID, &result.Chunk.DocumentID, &result.Chunk.ChunkIndex, &result.Chunk.Text, &page, &heading, &result.Chunk.CharStart, &result.Chunk.CharEnd, &result.Chunk.ContentHash,
+		&result.Source.ID, &result.Source.OriginalName, &result.Source.MediaType, &result.Source.SHA256, &result.Source.OriginalPath, &result.Source.ParsedPath, &result.Source.Status, &result.Source.ParserVersion, &created, &result.Source.ParseError,
+	)
+	if err != nil {
+		return result, err
+	}
+	if page.Valid {
+		value := int(page.Int64)
+		result.Chunk.PageNumber = &value
+	}
+	_ = json.Unmarshal([]byte(heading), &result.Chunk.HeadingPath)
+	result.Source.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+	return result, err
 }
 
 func insertDocument(ctx context.Context, tx *sql.Tx, document domain.SourceDocument) error {

@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { BookOpen, ChevronRight, FileText, GitBranch, History, Link2, PanelRightClose, PanelRightOpen } from 'lucide-react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { getWikiPage, getWikiPages, getWikiRevisions, type EvidenceView, type PageType } from '../../api/contracts'
 
 const types: { value: PageType; label: string }[] = [
@@ -21,16 +21,32 @@ function locationLabel(evidence: EvidenceView) {
 export function WikiBrowser() {
   const { slug } = useParams()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const pages = useQuery({ queryKey: ['wiki-pages'], queryFn: () => getWikiPages() })
   const detail = useQuery({ queryKey: ['wiki-page', slug], queryFn: () => getWikiPage(slug!), enabled: Boolean(slug) })
   const revisions = useQuery({ queryKey: ['wiki-revisions', slug], queryFn: () => getWikiRevisions(slug!), enabled: Boolean(slug) })
   const [selectedEvidence, setSelectedEvidence] = useState<EvidenceView | null>(null)
-  const [inspectorOpen, setInspectorOpen] = useState(true)
+  const inspectorRef = useRef<HTMLElement | null>(null)
+  const [inspectorOpen, setInspectorOpen] = useState(() => !window.matchMedia('(max-width: 760px)').matches)
   const [view, setView] = useState<'knowledge' | 'revisions'>('knowledge')
 
   useEffect(() => {
     if (!slug && pages.data?.[0]) navigate(`/wiki/${pages.data[0].slug}`, { replace: true })
   }, [navigate, pages.data, slug])
+
+  useEffect(() => {
+    const citationID = searchParams.get('citation')
+    if (!citationID || !detail.data) return
+    const evidence = detail.data.claims.flatMap(item => item.evidence).find(item => item.chunk.id === citationID)
+    if (evidence) {
+      setSelectedEvidence(evidence)
+      setInspectorOpen(true)
+    }
+  }, [detail.data, searchParams])
+
+  useEffect(() => {
+    if (selectedEvidence && inspectorOpen) inspectorRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [inspectorOpen, selectedEvidence])
 
   const grouped = useMemo(() => types.map(type => ({ ...type, pages: pages.data?.filter(page => page.page_type === type.value) ?? [] })), [pages.data])
 
@@ -93,14 +109,14 @@ export function WikiBrowser() {
       </>}
     </main>
 
-    {inspectorOpen && <aside className="citation-inspector" aria-label="Citation inspector">
-      <div className="inspector-title"><FileText size={17} /><span>Source Inspector</span></div>
+    {inspectorOpen && <aside ref={inspectorRef} className="citation-inspector" aria-label="Citation inspector">
+      <div className="inspector-title"><FileText size={17} /><span>Source Inspector</span><button className="inspector-close" aria-label="Close citation inspector" title="Close citation inspector" onClick={() => setInspectorOpen(false)}><PanelRightClose size={16} /></button></div>
       {selectedEvidence ? <>
         <h2>{selectedEvidence.source.original_name}</h2>
         <p className="source-location">{locationLabel(selectedEvidence)}</p>
         <blockquote>{selectedEvidence.chunk.text}</blockquote>
         <dl><div><dt>Chunk</dt><dd>{selectedEvidence.chunk.id}</dd></div><div><dt>Relation</dt><dd>{selectedEvidence.evidence.relation}</dd></div><div><dt>Media</dt><dd>{selectedEvidence.source.media_type}</dd></div></dl>
-      </> : <div className="inspector-empty"><ChevronRight size={18} /><p>Select a citation to inspect the exact Source Chunk and its original location.</p></div>}
+      </> : <div className="inspector-empty"><ChevronRight size={18} /><p>Select a citation to inspect the exact Source Chunk and its original location.</p><Link className="inspector-link" to="/sources">Open Sources</Link></div>}
     </aside>}
   </div>
 }

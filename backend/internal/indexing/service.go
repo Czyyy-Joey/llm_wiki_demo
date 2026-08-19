@@ -25,12 +25,17 @@ const (
 	SourceCollection   = "source_chunks"
 )
 
+func ProviderIdentity(endpoint, model string) string {
+	return strings.TrimRight(strings.TrimSpace(endpoint), "/") + "|" + strings.TrimSpace(model)
+}
+
 type Service struct {
-	DB        *sql.DB
-	Embedder  llm.EmbeddingClient
-	Model     string
-	BatchSize int
-	IndexDir  string
+	DB         *sql.DB
+	Embedder   llm.EmbeddingClient
+	Model      string
+	ProviderID string
+	BatchSize  int
+	IndexDir   string
 }
 
 type Passage struct {
@@ -63,6 +68,9 @@ func (s Service) Reindex(ctx context.Context) (IndexResult, error) {
 	}
 	if s.Model == "" {
 		s.Model = WikiEmbeddingModel
+	}
+	if s.ProviderID == "" {
+		s.ProviderID = s.Model
 	}
 	passages, err := s.loadPassages(ctx)
 	if err != nil {
@@ -106,7 +114,7 @@ func (s Service) Reindex(ctx context.Context) (IndexResult, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, passage := range passages {
 		encoded, _ := json.Marshal(passage.Embedding)
-		if _, err = tx.ExecContext(ctx, `INSERT INTO wiki_passages (id, page_id, section_id, title, heading_path, text, page_type, revision, content_hash, embedding_json, embedding_model, indexed_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, passage.ID, passage.PageID, passage.Title, passage.HeadingPath, passage.Text, passage.PageType, passage.Revision, passage.ContentHash, string(encoded), s.Model, now); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO wiki_passages (id, page_id, section_id, title, heading_path, text, page_type, revision, content_hash, embedding_json, embedding_model, indexed_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, passage.ID, passage.PageID, passage.Title, passage.HeadingPath, passage.Text, passage.PageType, passage.Revision, passage.ContentHash, string(encoded), s.ProviderID, now); err != nil {
 			return IndexResult{}, err
 		}
 		ftsTitle := strings.Join(Tokenize(passage.Title), " ")
@@ -117,7 +125,7 @@ func (s Service) Reindex(ctx context.Context) (IndexResult, error) {
 	}
 	for _, chunk := range chunks {
 		encoded, _ := json.Marshal(chunk.Embedding)
-		if _, err = tx.ExecContext(ctx, `INSERT INTO source_chunk_embeddings (source_chunk_id, content_hash, embedding_json, embedding_model, indexed_at) VALUES (?, ?, ?, ?, ?)`, chunk.ID, chunk.ContentHash, string(encoded), s.Model, now); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO source_chunk_embeddings (source_chunk_id, content_hash, embedding_json, embedding_model, indexed_at) VALUES (?, ?, ?, ?, ?)`, chunk.ID, chunk.ContentHash, string(encoded), s.ProviderID, now); err != nil {
 			return IndexResult{}, err
 		}
 	}
@@ -154,7 +162,7 @@ func (s Service) writeVectorIndexes(ctx context.Context, passages []Passage, chu
 	if err != nil {
 		return fmt.Errorf("open staged vector index: %w", err)
 	}
-	wiki, err := vectorDB.GetOrCreateCollection(WikiCollection, map[string]string{"model": s.Model, "kind": "wiki"}, nil)
+	wiki, err := vectorDB.GetOrCreateCollection(WikiCollection, map[string]string{"model": s.Model, "provider_id": s.ProviderID, "kind": "wiki"}, nil)
 	if err != nil {
 		return fmt.Errorf("create Wiki vector collection: %w", err)
 	}
@@ -172,7 +180,7 @@ func (s Service) writeVectorIndexes(ctx context.Context, passages []Passage, chu
 			return fmt.Errorf("write Wiki vector collection: %w", err)
 		}
 	}
-	source, err := vectorDB.GetOrCreateCollection(SourceCollection, map[string]string{"model": s.Model, "kind": "source"}, nil)
+	source, err := vectorDB.GetOrCreateCollection(SourceCollection, map[string]string{"model": s.Model, "provider_id": s.ProviderID, "kind": "source"}, nil)
 	if err != nil {
 		return fmt.Errorf("create Source vector collection: %w", err)
 	}
@@ -224,7 +232,7 @@ func (s Service) fillEmbeddings(ctx context.Context, work []embeddable, source b
 		inputs := make([]string, 0, end-start)
 		indexes := make([]int, 0, end-start)
 		for i := start; i < end; i++ {
-			model := s.Model
+			model := s.ProviderID
 			var hash, oldModel string
 			var oldJSON sql.NullString
 			table := "wiki_passages"

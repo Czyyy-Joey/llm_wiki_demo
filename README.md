@@ -4,7 +4,7 @@ LLM-Wiki is a local demo whose center is compiled Wiki knowledge: `Document -> U
 
 ## Current scope
 
-Phase 2 preserves and parses Markdown, TXT, and text-based PDF sources, then compiles structured analysis into traceable Wiki pages through `Parse -> Analyze -> Match -> Plan -> Validate -> Apply`. Indexing, retrieval, query, chat, and the full Wiki browsing UI remain reserved for later phases.
+The demo preserves and parses Markdown, TXT, and text-based PDF sources, compiles them into traceable Wiki pages, indexes the compiled Wiki, and exposes Wiki browsing, hybrid retrieval, query, and multi-turn chat in one UI.
 
 ## Run
 
@@ -17,9 +17,13 @@ make dev
 Backend: `http://127.0.0.1:8080/api/health`  
 OpenAPI: `http://127.0.0.1:8080/docs`
 
-LLM and embedding credentials are optional in Phase 0. The status endpoints explicitly report whether each provider is configured.
+LLM and embedding configuration is deliberately separate:
 
-Knowledge compilation uses an OpenAI-compatible Chat Completions provider when `COMPILER_LLM_ENDPOINT`, `COMPILER_LLM_API_KEY`, and `COMPILER_LLM_MODEL` are configured. For local development and tests only, set `COMPILER_LLM_FAKE_FALLBACK=true` to enable the deterministic fake adapter.
+- Compiler, Query, and Chat use Baidu OneAPI through OpenAI-compatible Chat Completions. Configure `LLM_BASE_URL`, `ONEAPI_API_KEY`, and `LLM_MODEL` in `.env` or Settings. The default base URL is `https://oneapi-comate.baidu-int.com/v1`.
+- Wiki and Source embeddings use local Ollama. Start Ollama, run `ollama pull qwen3-embedding:0.6b`, and configure `OLLAMA_BASE_URL` plus `EMBEDDING_MODEL`. Embeddings do not use an API key.
+- `LLM_FAKE_FALLBACK=true` enables deterministic generation for explicit local demo/test use when OneAPI credentials are unavailable.
+
+Provider status reports whether credentials are configured but never returns the OneAPI API key. Changing the embedding base URL or model marks active pages `index_pending`; run **Reindex now** in Settings before relying on vector search.
 
 ## Source API
 

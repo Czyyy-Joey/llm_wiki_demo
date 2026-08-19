@@ -208,12 +208,32 @@ type Conversation struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
+type CitationSnapshot struct {
+	ID            string `json:"id"`
+	Kind          string `json:"kind"`
+	PageID        string `json:"page_id,omitempty"`
+	PassageID     string `json:"passage_id,omitempty"`
+	SourceChunkID string `json:"source_chunk_id,omitempty"`
+	Label         string `json:"label"`
+	Text          string `json:"text"`
+}
 type Message struct {
-	ID               string    `json:"id"`
-	ConversationID   string    `json:"conversation_id"`
-	Role             string    `json:"role"`
-	Content          string    `json:"content"`
-	RetrievalTraceID string    `json:"retrieval_trace_id,omitempty"`
-	Citations        []string  `json:"citations,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
+	ID               string             `json:"id"`
+	ConversationID   string             `json:"conversation_id"`
+	Role             string             `json:"role"`
+	Content          string             `json:"content"`
+	RetrievalTraceID string             `json:"retrieval_trace_id,omitempty"`
+	StandaloneQuery  string             `json:"standalone_query,omitempty"`
+	Citations        []CitationSnapshot `json:"citations,omitempty"`
+	Context          []CitationSnapshot `json:"context,omitempty"`
+	CreatedAt        time.Time          `json:"created_at"`
+}
+
+type StandaloneQuery struct {
+	Query string `json:"query"`
+}
+
+type GeneratedAnswer struct {
+	Answer      string   `json:"answer"`
+	CitationIDs []string `json:"citation_ids"`
 }

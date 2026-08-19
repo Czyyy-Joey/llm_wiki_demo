@@ -1,0 +1,1 @@
+Rewrite the follow-up question as one standalone retrieval query. Use only the bounded recent history supplied by the application. Resolve references when the history supports them. Do not answer the question. Return JSON matching the StandaloneQuery schema.

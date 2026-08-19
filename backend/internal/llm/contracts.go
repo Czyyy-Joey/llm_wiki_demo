@@ -30,6 +30,19 @@ type LLMClient interface {
 type EmbeddingClient interface {
 	Embed(context.Context, []string) ([][]float32, error)
 }
+type ChatTurn struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+type AnswerContext struct {
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
+	Text string `json:"text"`
+}
+type GenerationClient interface {
+	Rewrite(context.Context, string, []ChatTurn) (json.RawMessage, error)
+	Answer(context.Context, string, []AnswerContext) (json.RawMessage, error)
+}
 
 type DeterministicEmbedding struct{}
 
@@ -216,6 +229,50 @@ func (DeterministicFake) Embed(_ context.Context, inputs []string) ([][]float32,
 		result[i] = []float32{float32(len(input)), float32(len(strings.Fields(input)))}
 	}
 	return result, nil
+}
+
+func (DeterministicFake) Rewrite(_ context.Context, question string, history []ChatTurn) (json.RawMessage, error) {
+	query := strings.TrimSpace(question)
+	if needsHistory(query) {
+		for i := len(history) - 1; i >= 0; i-- {
+			if history[i].Role == "user" && strings.TrimSpace(history[i].Content) != "" {
+				query = strings.TrimSpace(history[i].Content) + " " + query
+				break
+			}
+		}
+	}
+	return json.Marshal(domain.StandaloneQuery{Query: query})
+}
+
+func (DeterministicFake) Answer(_ context.Context, _ string, contextItems []AnswerContext) (json.RawMessage, error) {
+	if len(contextItems) == 0 {
+		return json.Marshal(domain.GeneratedAnswer{Answer: "知识库证据不足，无法基于现有证据回答。", CitationIDs: []string{}})
+	}
+	selected := -1
+	for i := range contextItems {
+		if strings.HasPrefix(contextItems[i].Kind, "source_") {
+			selected = i
+			break
+		}
+	}
+	if selected < 0 {
+		return json.Marshal(domain.GeneratedAnswer{Answer: "知识库证据不足，无法基于现有证据回答。", CitationIDs: []string{}})
+	}
+	text := strings.TrimSpace(contextItems[selected].Text)
+	if len(text) > 360 {
+		text = text[:360]
+	}
+	return json.Marshal(domain.GeneratedAnswer{Answer: text, CitationIDs: []string{contextItems[selected].ID}})
+}
+
+func needsHistory(question string) bool {
+	lower := strings.ToLower(question)
+	for _, marker := range []string{" it ", " they ", " them ", " that ", " this ", "其", "它", "这", "那", "上述", "前者", "后者"} {
+		if strings.Contains(" "+lower+" ", marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func firstSummary(chunks []domain.SourceChunk) string {

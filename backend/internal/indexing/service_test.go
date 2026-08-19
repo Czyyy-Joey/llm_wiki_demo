@@ -55,7 +55,7 @@ func TestReindexPersistsChromemAndReusesUnchangedEmbeddings(t *testing.T) {
 
 	indexDir := filepath.Join(t.TempDir(), "indexes")
 	embedder := &countingEmbedder{}
-	service := Service{DB: database, Embedder: embedder, Model: "test-embedding-v1", BatchSize: 8, IndexDir: indexDir}
+	service := Service{DB: database, Embedder: embedder, Model: "test-embedding-v1", ProviderID: ProviderIdentity("http://ollama-a.example", "test-embedding-v1"), BatchSize: 8, IndexDir: indexDir}
 	first, err := service.Reindex(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -93,6 +93,14 @@ func TestReindexPersistsChromemAndReusesUnchangedEmbeddings(t *testing.T) {
 	}
 	if third.EmbeddingsMade != 1 || embedder.inputs != 3 {
 		t.Fatalf("incremental reindex = %#v, embedded inputs = %d", third, embedder.inputs)
+	}
+	service.ProviderID = ProviderIdentity("http://ollama-b.example", service.Model)
+	providerChanged, err := service.Reindex(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if providerChanged.EmbeddingsMade != 2 || embedder.inputs != 5 {
+		t.Fatalf("provider change reused stale vectors: result = %#v, embedded inputs = %d", providerChanged, embedder.inputs)
 	}
 
 	if err := os.RemoveAll(indexDir); err != nil {
