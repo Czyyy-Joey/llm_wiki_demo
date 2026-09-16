@@ -1,8 +1,10 @@
 .env
 backend/server
 backend/.gocache/
+backend/.cache/
 data/*.db
 data/*.db-*
 frontend/dist/
 frontend/node_modules/
 frontend/tsconfig.tsbuildinfo
+logs/

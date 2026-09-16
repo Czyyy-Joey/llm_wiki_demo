@@ -68,7 +68,7 @@ type DeterministicFake struct{}
 
 func (DeterministicFake) Name() string { return "deterministic-fake" }
 
-func (DeterministicFake) Analyze(_ context.Context, input AnalyzeInput) (json.RawMessage, error) {
+func (DeterministicFake) Analyze(ctx context.Context, input AnalyzeInput) (json.RawMessage, error) {
 	type topic struct {
 		Key      string           `json:"key"`
 		Title    string           `json:"title"`
@@ -136,10 +136,15 @@ func fakePageType(title string) domain.PageType {
 	if strings.Contains(lowerTitle, "topic") {
 		return domain.PageTypeTopic
 	}
+	for _, marker := range []string{"plan", "schedule", "timeline", "checklist", "task", "计划", "时间表", "清单", "任务"} {
+		if strings.Contains(lowerTitle, marker) {
+			return domain.PageTypeTopic
+		}
+	}
 	return domain.PageTypeConcept
 }
 
-func (DeterministicFake) Plan(_ context.Context, input PlanInput) (json.RawMessage, error) {
+func (DeterministicFake) Plan(ctx context.Context, input PlanInput) (json.RawMessage, error) {
 	var analysis struct {
 		DocumentID string `json:"document_id"`
 		Topics     []struct {
@@ -178,12 +183,16 @@ func (DeterministicFake) Plan(_ context.Context, input PlanInput) (json.RawMessa
 				}
 			}
 		}
-		action := domain.PageAction{Action: domain.ActionCreate, Slug: topic.Slug, PageType: topic.PageType, Title: topic.Title, Summary: topic.Summary, Reason: "create a compiled knowledge page"}
+		createReason, updateReason, noOpReason := "创建编译知识页面", "将来源证据融合到已有知识页面", "来源没有增加新 claim"
+		if LanguageFromContext(ctx) == "en" {
+			createReason, updateReason, noOpReason = "create a compiled knowledge page", "add source evidence to the existing knowledge page", "the source adds no new claims"
+		}
+		action := domain.PageAction{Action: domain.ActionCreate, Slug: topic.Slug, PageType: topic.PageType, Title: topic.Title, Summary: topic.Summary, Reason: createReason}
 		if match != nil {
 			matched[topic.Key] = *match
 			action.Action = domain.ActionUpdate
 			action.TargetPageID = match.PageID
-			action.Reason = "add source evidence to the existing knowledge page"
+			action.Reason = updateReason
 		}
 		for _, claim := range topic.Claims {
 			duplicate := false
@@ -201,7 +210,7 @@ func (DeterministicFake) Plan(_ context.Context, input PlanInput) (json.RawMessa
 		}
 		if match != nil && len(action.ClaimActions) == 0 {
 			action.Action = domain.ActionNoOp
-			action.Reason = "the source adds no new claims"
+			action.Reason = noOpReason
 		}
 		actions = append(actions, action)
 		if match != nil && alternate != nil {
@@ -244,9 +253,13 @@ func (DeterministicFake) Rewrite(_ context.Context, question string, history []C
 	return json.Marshal(domain.StandaloneQuery{Query: query})
 }
 
-func (DeterministicFake) Answer(_ context.Context, _ string, contextItems []AnswerContext) (json.RawMessage, error) {
+func (DeterministicFake) Answer(ctx context.Context, _ string, contextItems []AnswerContext) (json.RawMessage, error) {
+	insufficient := "知识库证据不足，无法基于现有证据回答。"
+	if LanguageFromContext(ctx) == "en" {
+		insufficient = "The knowledge base does not contain enough evidence to answer."
+	}
 	if len(contextItems) == 0 {
-		return json.Marshal(domain.GeneratedAnswer{Answer: "知识库证据不足，无法基于现有证据回答。", CitationIDs: []string{}})
+		return json.Marshal(domain.GeneratedAnswer{Answer: insufficient, CitationIDs: []string{}})
 	}
 	selected := -1
 	for i := range contextItems {
@@ -256,7 +269,7 @@ func (DeterministicFake) Answer(_ context.Context, _ string, contextItems []Answ
 		}
 	}
 	if selected < 0 {
-		return json.Marshal(domain.GeneratedAnswer{Answer: "知识库证据不足，无法基于现有证据回答。", CitationIDs: []string{}})
+		return json.Marshal(domain.GeneratedAnswer{Answer: insufficient, CitationIDs: []string{}})
 	}
 	text := strings.TrimSpace(contextItems[selected].Text)
 	if len(text) > 360 {
@@ -313,7 +326,81 @@ func DecodeStrict[T any](data []byte) (T, error) {
 
 func SchemaFor[T any]() *huma.Schema {
 	registry := huma.NewMapRegistry("#/components/schemas/", huma.DefaultSchemaNamer)
-	return inlineSchema(huma.SchemaFromType(registry, reflect.TypeFor[T]()), registry, map[string]bool{})
+	typeOf := reflect.TypeFor[T]()
+	schema := inlineSchema(huma.SchemaFromType(registry, typeOf), registry, map[string]bool{})
+	applyDomainEnums(schema, dereference(typeOf))
+	return schema
+}
+
+// applyDomainEnums keeps the provider-facing schema aligned with the domain's
+// named string contracts. Reflection does not infer enum values from Go
+// constants, so without this pass a structured-output provider can legally
+// invent values such as "plan" for AnalyzedTopic.page_type.
+func applyDomainEnums(schema *huma.Schema, typeOf reflect.Type) {
+	if schema == nil || typeOf == nil {
+		return
+	}
+	typeOf = dereference(typeOf)
+	switch typeOf {
+	case reflect.TypeOf(domain.PageType("")):
+		schema.Enum = []any{string(domain.PageTypeConcept), string(domain.PageTypeEntity), string(domain.PageTypeTopic)}
+		return
+	case reflect.TypeOf(domain.ClaimType("")):
+		schema.Enum = []any{string(domain.ClaimFact), string(domain.ClaimDefinition), string(domain.ClaimArgument), string(domain.ClaimProcedure), string(domain.ClaimCaveat)}
+		return
+	case reflect.TypeOf(domain.PlanAction("")):
+		schema.Enum = []any{string(domain.ActionCreate), string(domain.ActionUpdate), string(domain.ActionMerge), string(domain.ActionLink), string(domain.ActionNoOp)}
+		return
+	}
+	if typeOf.Kind() == reflect.Slice || typeOf.Kind() == reflect.Array {
+		applyDomainEnums(schema.Items, dereference(typeOf.Elem()))
+		return
+	}
+	if typeOf.Kind() != reflect.Struct {
+		return
+	}
+	for i := 0; i < typeOf.NumField(); i++ {
+		field := typeOf.Field(i)
+		if field.PkgPath != "" { // unexported
+			continue
+		}
+		name := jsonFieldName(field)
+		if name == "-" {
+			continue
+		}
+		property := schema.Properties[name]
+		if property == nil {
+			continue
+		}
+		fieldType := dereference(field.Type)
+		switch {
+		case name == "action" && fieldType.Kind() == reflect.String && typeOf == reflect.TypeOf(domain.ClaimAction{}):
+			property.Enum = []any{"ADD", "REVISE", "RETAIN", "MARK_DISPUTED", "SUPERSEDE"}
+		case name == "relation" && fieldType.Kind() == reflect.String:
+			property.Enum = []any{"related_to", "part_of", "depends_on", "contradicts", "supports", "references"}
+		default:
+			applyDomainEnums(property, fieldType)
+		}
+	}
+}
+
+func dereference(typeOf reflect.Type) reflect.Type {
+	for typeOf != nil && (typeOf.Kind() == reflect.Pointer || typeOf.Kind() == reflect.Interface) {
+		typeOf = typeOf.Elem()
+	}
+	return typeOf
+}
+
+func jsonFieldName(field reflect.StructField) string {
+	tag := field.Tag.Get("json")
+	if tag == "" {
+		return field.Name
+	}
+	name := strings.Split(tag, ",")[0]
+	if name == "" {
+		return field.Name
+	}
+	return name
 }
 
 func inlineSchema(schema *huma.Schema, registry huma.Registry, resolving map[string]bool) *huma.Schema {

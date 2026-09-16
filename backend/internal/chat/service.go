@@ -12,16 +12,24 @@ import (
 	"unicode/utf8"
 
 	"github.com/joeychen/llm-wiki-demo/backend/internal/domain"
+	"github.com/joeychen/llm-wiki-demo/backend/internal/knowledgebase"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/llm"
+	"github.com/joeychen/llm-wiki-demo/backend/internal/logging"
 	queryservice "github.com/joeychen/llm-wiki-demo/backend/internal/query"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/retrieval"
 )
 
 type Service struct {
-	DB            *sql.DB
-	Query         queryservice.Service
-	Generator     llm.GenerationClient
-	HistoryBudget int
+	DB              *sql.DB
+	Query           queryservice.Service
+	Generator       llm.GenerationClient
+	HistoryBudget   int
+	KnowledgeBaseID string
+	Language        string
+}
+
+func (s Service) scope(ctx context.Context) string {
+	return knowledgebase.Scope(ctx, s.KnowledgeBaseID)
 }
 
 type Detail struct {
@@ -48,13 +56,13 @@ func (s Service) Create(ctx context.Context, title string) (domain.Conversation,
 		title = "New conversation"
 	}
 	now := time.Now().UTC()
-	conversation := domain.Conversation{ID: stableID("conversation", title, now), Title: title, CreatedAt: now, UpdatedAt: now}
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)`, conversation.ID, conversation.Title, formatTime(now), formatTime(now))
+	conversation := domain.Conversation{ID: stableID("conversation", s.scope(ctx)+title, now), Title: title, CreatedAt: now, UpdatedAt: now}
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO conversations (id, knowledge_base_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, conversation.ID, s.scope(ctx), conversation.Title, formatTime(now), formatTime(now))
 	return conversation, err
 }
 
 func (s Service) List(ctx context.Context) ([]domain.Conversation, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC, id`)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, title, created_at, updated_at FROM conversations WHERE knowledge_base_id = ? ORDER BY updated_at DESC, id`, s.scope(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -76,13 +84,13 @@ func (s Service) List(ctx context.Context) ([]domain.Conversation, error) {
 func (s Service) Get(ctx context.Context, id string) (Detail, error) {
 	var detail Detail
 	var created, updated string
-	err := s.DB.QueryRowContext(ctx, `SELECT id, title, created_at, updated_at FROM conversations WHERE id = ?`, id).Scan(&detail.Conversation.ID, &detail.Conversation.Title, &created, &updated)
+	err := s.DB.QueryRowContext(ctx, `SELECT id, title, created_at, updated_at FROM conversations WHERE id = ? AND knowledge_base_id = ?`, id, s.scope(ctx)).Scan(&detail.Conversation.ID, &detail.Conversation.Title, &created, &updated)
 	if err != nil {
 		return Detail{}, err
 	}
 	detail.Conversation.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	detail.Conversation.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, conversation_id, role, content, COALESCE(retrieval_trace_id, ''), COALESCE(standalone_query, ''), COALESCE(citations_json, '[]'), COALESCE(context_json, '[]'), created_at FROM messages WHERE conversation_id = ? ORDER BY created_at, CASE role WHEN 'user' THEN 0 ELSE 1 END, id`, id)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, conversation_id, role, content, COALESCE(retrieval_trace_id, ''), COALESCE(standalone_query, ''), COALESCE(citations_json, '[]'), COALESCE(context_json, '[]'), created_at FROM messages WHERE conversation_id = ? AND knowledge_base_id = ? ORDER BY created_at, CASE role WHEN 'user' THEN 0 ELSE 1 END, id`, id, s.scope(ctx))
 	if err != nil {
 		return Detail{}, err
 	}
@@ -108,10 +116,10 @@ func (s Service) Delete(ctx context.Context, id string) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `DELETE FROM messages WHERE conversation_id = ?`, id); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM messages WHERE conversation_id = ? AND knowledge_base_id = ?`, id, s.scope(ctx)); err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, `DELETE FROM conversations WHERE id = ?`, id)
+	result, err := tx.ExecContext(ctx, `DELETE FROM conversations WHERE id = ? AND knowledge_base_id = ?`, id, s.scope(ctx))
 	if err != nil {
 		return err
 	}
@@ -122,7 +130,10 @@ func (s Service) Delete(ctx context.Context, id string) error {
 }
 
 func (s Service) Send(ctx context.Context, conversationID, question string) (TurnResult, error) {
+	ctx = llm.WithLanguage(ctx, s.Language)
+	started := time.Now()
 	question = strings.TrimSpace(question)
+	logging.Logger(ctx).Info("chat turn started", "conversation_id", conversationID, "question_length", utf8.RuneCountInString(question))
 	if question == "" {
 		return TurnResult{}, fmt.Errorf("question is required")
 	}
@@ -135,6 +146,7 @@ func (s Service) Send(ctx context.Context, conversationID, question string) (Tur
 	}
 	raw, err := s.Generator.Rewrite(ctx, question, history)
 	if err != nil {
+		logging.Logger(ctx).Error("chat query rewrite failed", "conversation_id", conversationID, "history_turns", len(history), "error", logging.SafeSummary(err))
 		return TurnResult{}, err
 	}
 	rewritten, err := llm.DecodeStrict[domain.StandaloneQuery](raw)
@@ -147,26 +159,29 @@ func (s Service) Send(ctx context.Context, conversationID, question string) (Tur
 	}
 	answer, err := s.Query.AskWithRetrievalQuery(ctx, question, rewritten.Query)
 	if err != nil {
+		logging.Logger(ctx).Error("chat answer failed", "conversation_id", conversationID, "error", logging.SafeSummary(err))
 		return TurnResult{}, err
 	}
 	now := time.Now().UTC()
 	user := domain.Message{ID: stableID("message-user", conversationID+question, now), ConversationID: conversationID, Role: "user", Content: question, CreatedAt: now}
 	assistant := domain.Message{ID: stableID("message-assistant", conversationID+answer.Answer, now), ConversationID: conversationID, Role: "assistant", Content: answer.Answer, RetrievalTraceID: answer.Trace.ID, StandaloneQuery: rewritten.Query, Citations: answer.Citations, Context: answer.Context, CreatedAt: now}
 	if err := s.saveTurn(ctx, user, assistant); err != nil {
+		logging.Logger(ctx).Error("chat persistence failed", "conversation_id", conversationID, "trace_id", answer.Trace.ID, "error", logging.SafeSummary(err))
 		return TurnResult{}, err
 	}
+	logging.Logger(ctx).Info("chat turn completed", "conversation_id", conversationID, "trace_id", answer.Trace.ID, "history_turns", len(history), "context_items", len(answer.Context), "citations", len(answer.Citations), "duration_ms", logging.Duration(started))
 	return TurnResult{UserMessage: user, AssistantMessage: assistant, Result: answer}, nil
 }
 
 func (s Service) recentHistory(ctx context.Context, conversationID string) ([]llm.ChatTurn, error) {
 	var exists int
-	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM conversations WHERE id = ?`, conversationID).Scan(&exists); err != nil {
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM conversations WHERE id = ? AND knowledge_base_id = ?`, conversationID, s.scope(ctx)).Scan(&exists); err != nil {
 		return nil, err
 	}
 	if exists == 0 {
 		return nil, sql.ErrNoRows
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at DESC, CASE role WHEN 'assistant' THEN 1 ELSE 0 END DESC, id DESC`, conversationID)
+	rows, err := s.DB.QueryContext(ctx, `SELECT role, content FROM messages WHERE conversation_id = ? AND knowledge_base_id = ? ORDER BY created_at DESC, CASE role WHEN 'assistant' THEN 1 ELSE 0 END DESC, id DESC`, conversationID, s.scope(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -202,13 +217,13 @@ func (s Service) saveTurn(ctx context.Context, user, assistant domain.Message) e
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)`, user.ID, user.ConversationID, user.Role, user.Content, formatTime(user.CreatedAt)); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO messages (id, knowledge_base_id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?, ?)`, user.ID, s.scope(ctx), user.ConversationID, user.Role, user.Content, formatTime(user.CreatedAt)); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO messages (id, conversation_id, role, content, retrieval_trace_id, standalone_query, citations_json, context_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, assistant.ID, assistant.ConversationID, assistant.Role, assistant.Content, assistant.RetrievalTraceID, assistant.StandaloneQuery, queryservice.EncodeSnapshots(assistant.Citations), queryservice.EncodeSnapshots(assistant.Context), formatTime(assistant.CreatedAt)); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO messages (id, knowledge_base_id, conversation_id, role, content, retrieval_trace_id, standalone_query, citations_json, context_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, assistant.ID, s.scope(ctx), assistant.ConversationID, assistant.Role, assistant.Content, assistant.RetrievalTraceID, assistant.StandaloneQuery, queryservice.EncodeSnapshots(assistant.Citations), queryservice.EncodeSnapshots(assistant.Context), formatTime(assistant.CreatedAt)); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE conversations SET updated_at = ? WHERE id = ?`, formatTime(assistant.CreatedAt), assistant.ConversationID)
+	_, err = tx.ExecContext(ctx, `UPDATE conversations SET updated_at = ? WHERE id = ? AND knowledge_base_id = ?`, formatTime(assistant.CreatedAt), assistant.ConversationID, s.scope(ctx))
 	if err != nil {
 		return err
 	}

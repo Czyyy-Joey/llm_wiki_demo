@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/danielgtaylor/huma/v2"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/domain"
 )
 
@@ -43,6 +45,33 @@ func TestSchemaForCompilationPlan(t *testing.T) {
 	}
 }
 
+func TestSchemaForSourceAnalysisConstrainsDomainEnums(t *testing.T) {
+	schema := SchemaFor[domain.SourceAnalysis]()
+	topic := schema.Properties["topics"].Items.Properties["page_type"]
+	assertSchemaEnum(t, topic, []any{"concept", "entity", "topic"})
+	claim := schema.Properties["topics"].Items.Properties["claims"].Items.Properties["claim_type"]
+	assertSchemaEnum(t, claim, []any{"fact", "definition", "argument", "procedure", "caveat"})
+	relation := schema.Properties["relations"].Items.Properties["relation"]
+	assertSchemaEnum(t, relation, []any{"related_to", "part_of", "depends_on", "contradicts", "supports", "references"})
+}
+
+func TestSchemaForCompilationPlanConstrainsActionsAndRelations(t *testing.T) {
+	schema := SchemaFor[domain.CompilationPlan]()
+	pageAction := schema.Properties["page_actions"].Items
+	assertSchemaEnum(t, pageAction.Properties["action"], []any{"CREATE", "UPDATE", "MERGE", "LINK", "NO_OP"})
+	assertSchemaEnum(t, pageAction.Properties["relation"], []any{"related_to", "part_of", "depends_on", "contradicts", "supports", "references"})
+	claimAction := pageAction.Properties["claim_actions"].Items
+	assertSchemaEnum(t, claimAction.Properties["action"], []any{"ADD", "REVISE", "RETAIN", "MARK_DISPUTED", "SUPERSEDE"})
+	assertSchemaEnum(t, claimAction.Properties["claim_type"], []any{"fact", "definition", "argument", "procedure", "caveat"})
+}
+
+func assertSchemaEnum(t *testing.T, schema *huma.Schema, expected []any) {
+	t.Helper()
+	if schema == nil || !reflect.DeepEqual(schema.Enum, expected) {
+		t.Fatalf("schema enum = %#v, want %#v", schema, expected)
+	}
+}
+
 func TestDeterministicFakeGroupsTopicsByHeading(t *testing.T) {
 	client := DeterministicFake{}
 	data, err := client.Analyze(context.Background(), AnalyzeInput{
@@ -65,6 +94,25 @@ func TestDeterministicFakeGroupsTopicsByHeading(t *testing.T) {
 	}
 	if len(analysis.Topics[0].Claims) != 2 || len(analysis.Topics[1].Claims) != 1 {
 		t.Fatalf("claims were not grouped by heading: %#v", analysis.Topics)
+	}
+}
+
+func TestAnalyzeScheduleUsesSupportedTopicPageType(t *testing.T) {
+	data, err := (DeterministicFake{}).Analyze(context.Background(), AnalyzeInput{
+		Document: domain.SourceDocument{ID: "doc-moving", OriginalName: "搬迁计划.md"},
+		Chunks: []domain.SourceChunk{{
+			ID: "chunk-moving", Text: "搬迁时间表包含打包和运输任务。", HeadingPath: []string{"搬迁计划 / 时间表"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	analysis, err := DecodeStrict[domain.SourceAnalysis](data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(analysis.Topics) != 1 || analysis.Topics[0].PageType != domain.PageTypeTopic {
+		t.Fatalf("moving plan analysis = %#v, want one topic page", analysis.Topics)
 	}
 }
 

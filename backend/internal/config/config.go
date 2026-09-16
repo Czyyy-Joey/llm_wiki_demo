@@ -10,6 +10,8 @@ import (
 
 type Config struct {
 	Addr                 string
+	LogLevel             string
+	LogFile              string
 	DatabaseURL          string
 	DataRoot             string
 	CompilerLLMKey       string
@@ -47,6 +49,8 @@ func Load() Config {
 	llmFakeFallback := envBool("LLM_FAKE_FALLBACK", false)
 	return Config{
 		Addr:                 env("APP_ADDR", "127.0.0.1:8080"),
+		LogLevel:             env("LOG_LEVEL", "info"),
+		LogFile:              env("LOG_FILE", "../logs/app.log"),
 		DatabaseURL:          env("DATABASE_URL", "file:../data/app.db?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"),
 		DataRoot:             env("DATA_ROOT", "../data"),
 		CompilerLLMKey:       env("COMPILER_LLM_API_KEY", llmAPIKey),

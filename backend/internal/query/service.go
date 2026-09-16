@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/joeychen/llm-wiki-demo/backend/internal/domain"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/llm"
+	"github.com/joeychen/llm-wiki-demo/backend/internal/logging"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/retrieval"
 )
 
@@ -20,6 +22,14 @@ type Retriever interface {
 type Service struct {
 	Retriever Retriever
 	Generator llm.GenerationClient
+	Language  string
+}
+
+func insufficientEvidence(language string) string {
+	if language == "en" {
+		return "The knowledge base does not contain enough evidence to answer."
+	}
+	return InsufficientEvidence
 }
 
 type Result struct {
@@ -38,6 +48,8 @@ func (s Service) Ask(ctx context.Context, question string) (Result, error) {
 // AskWithRetrievalQuery preserves the user's wording for answer generation
 // while allowing Chat to retrieve with a standalone rewrite.
 func (s Service) AskWithRetrievalQuery(ctx context.Context, question, retrievalQuery string) (Result, error) {
+	ctx = llm.WithLanguage(ctx, s.Language)
+	started := time.Now()
 	question = strings.TrimSpace(question)
 	if question == "" {
 		return Result{}, fmt.Errorf("question is required")
@@ -54,12 +66,15 @@ func (s Service) AskWithRetrievalQuery(ctx context.Context, question, retrievalQ
 	}
 	retrieved, err := s.Retriever.Search(ctx, retrievalQuery)
 	if err != nil {
+		logging.Logger(ctx).Error("query retrieval failed", "error", logging.SafeSummary(err))
 		return Result{}, err
 	}
+	logging.Logger(ctx).Info("query retrieval completed", "trace_id", retrieved.Trace.ID, "context_items", len(retrieved.Context))
 	contextSnapshots := snapshots(retrieved.Context)
 	result := Result{Question: question, Context: contextSnapshots, Trace: retrieved.Trace, Citations: []domain.CitationSnapshot{}, WikiReferences: wikiReferences(retrieved)}
 	if len(retrieved.Context) == 0 {
-		result.Answer = InsufficientEvidence
+		result.Answer = insufficientEvidence(s.Language)
+		logging.Logger(ctx).Warn("query insufficient evidence", "trace_id", retrieved.Trace.ID, "duration_ms", logging.Duration(started))
 		return result, nil
 	}
 	answerContext := make([]llm.AnswerContext, len(retrieved.Context))
@@ -72,6 +87,7 @@ func (s Service) AskWithRetrievalQuery(ctx context.Context, question, retrievalQ
 	}
 	raw, err := s.Generator.Answer(ctx, question, answerContext)
 	if err != nil {
+		logging.Logger(ctx).Error("query answer generation failed", "trace_id", retrieved.Trace.ID, "error", logging.SafeSummary(err))
 		return Result{}, err
 	}
 	generated, err := llm.DecodeStrict[domain.GeneratedAnswer](raw)
@@ -87,9 +103,10 @@ func (s Service) AskWithRetrievalQuery(ctx context.Context, question, retrievalQ
 	}
 	result.Answer = strings.TrimSpace(generated.Answer)
 	if result.Answer == "" || len(result.Citations) == 0 {
-		result.Answer = InsufficientEvidence
+		result.Answer = insufficientEvidence(s.Language)
 		result.Citations = []domain.CitationSnapshot{}
 	}
+	logging.Logger(ctx).Info("query completed", "trace_id", retrieved.Trace.ID, "citations", len(result.Citations), "wiki_references", len(result.WikiReferences), "duration_ms", logging.Duration(started))
 	return result, nil
 }
 

@@ -42,30 +42,33 @@ const (
 )
 
 type SourceDocument struct {
-	ID            string    `json:"id"`
-	OriginalName  string    `json:"original_name"`
-	MediaType     string    `json:"media_type"`
-	SHA256        string    `json:"sha256"`
-	OriginalPath  string    `json:"original_path"`
-	ParsedPath    string    `json:"parsed_path"`
-	Status        string    `json:"status"`
-	ParserVersion string    `json:"parser_version"`
-	CreatedAt     time.Time `json:"created_at"`
-	ParseError    string    `json:"parse_error,omitempty"`
+	ID              string    `json:"id"`
+	KnowledgeBaseID string    `json:"knowledge_base_id,omitempty"`
+	OriginalName    string    `json:"original_name"`
+	MediaType       string    `json:"media_type"`
+	SHA256          string    `json:"sha256"`
+	OriginalPath    string    `json:"original_path"`
+	ParsedPath      string    `json:"parsed_path"`
+	Status          string    `json:"status"`
+	ParserVersion   string    `json:"parser_version"`
+	CreatedAt       time.Time `json:"created_at"`
+	ParseError      string    `json:"parse_error,omitempty"`
 }
 type SourceChunk struct {
-	ID          string   `json:"id"`
-	DocumentID  string   `json:"document_id"`
-	ChunkIndex  int      `json:"chunk_index"`
-	Text        string   `json:"text"`
-	PageNumber  *int     `json:"page_number,omitempty"`
-	HeadingPath []string `json:"heading_path,omitempty"`
-	CharStart   int      `json:"char_start"`
-	CharEnd     int      `json:"char_end"`
-	ContentHash string   `json:"content_hash"`
+	ID              string   `json:"id"`
+	KnowledgeBaseID string   `json:"knowledge_base_id,omitempty"`
+	DocumentID      string   `json:"document_id"`
+	ChunkIndex      int      `json:"chunk_index"`
+	Text            string   `json:"text"`
+	PageNumber      *int     `json:"page_number,omitempty"`
+	HeadingPath     []string `json:"heading_path,omitempty"`
+	CharStart       int      `json:"char_start"`
+	CharEnd         int      `json:"char_end"`
+	ContentHash     string   `json:"content_hash"`
 }
 type WikiPage struct {
 	ID              string     `json:"id"`
+	KnowledgeBaseID string     `json:"knowledge_base_id,omitempty"`
 	Slug            string     `json:"slug"`
 	PageType        PageType   `json:"page_type"`
 	Title           string     `json:"title"`

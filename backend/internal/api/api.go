@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humachi"
@@ -24,7 +25,9 @@ import (
 	"github.com/joeychen/llm-wiki-demo/backend/internal/config"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/domain"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/indexing"
+	"github.com/joeychen/llm-wiki-demo/backend/internal/knowledgebase"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/llm"
+	"github.com/joeychen/llm-wiki-demo/backend/internal/logging"
 	queryservice "github.com/joeychen/llm-wiki-demo/backend/internal/query"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/retrieval"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/sources"
@@ -32,16 +35,17 @@ import (
 )
 
 type Server struct {
-	mu        sync.RWMutex
-	DB        *sql.DB
-	Config    config.Config
-	Sources   sources.Service
-	Compiler  compiler.Service
-	Wiki      wiki.Service
-	Indexer   indexing.Service
-	Retriever retrieval.Service
-	Query     queryservice.Service
-	Chat      chatservice.Service
+	mu             sync.RWMutex
+	DB             *sql.DB
+	Config         config.Config
+	Sources        sources.Service
+	Compiler       compiler.Service
+	Wiki           wiki.Service
+	Indexer        indexing.Service
+	Retriever      retrieval.Service
+	Query          queryservice.Service
+	Chat           chatservice.Service
+	KnowledgeBases knowledgebase.Service
 }
 
 // BindRuntimeServices keeps the compiler, indexer, retriever, query, and chat
@@ -80,6 +84,7 @@ type PublicEmbeddingSettings struct {
 type PublicSettings struct {
 	LLM       PublicLLMSettings       `json:"llm"`
 	Embedding PublicEmbeddingSettings `json:"embedding"`
+	Language  string                  `json:"language"`
 }
 type ErrorResponse struct {
 	Body struct {
@@ -97,12 +102,19 @@ func (s *Server) Router() http.Handler {
 	huma.Register(api, huma.Operation{OperationID: "health", Method: http.MethodGet, Path: "/api/health", Summary: "Application and database health"}, func(ctx context.Context, input *struct{}) (*HealthResponse, error) { return s.health() })
 	huma.Register(api, huma.Operation{OperationID: "config-status", Method: http.MethodGet, Path: "/api/config/status", Summary: "Configured provider status"}, func(ctx context.Context, input *struct{}) (*ConfigResponse, error) {
 		out := &ConfigResponse{}
-		s.mu.RLock()
-		out.Body.Providers = s.Config.ProviderStatus()
-		out.Body.Settings = publicSettings(s.Config)
-		s.mu.RUnlock()
+		runtime, ok := runtimeFromContext(ctx)
+		if !ok {
+			return nil, fmt.Errorf("knowledge base runtime is unavailable")
+		}
+		out.Body.Providers = providerStatus(runtime.Effective)
+		out.Body.Settings = publicEffectiveSettings(runtime)
 		return out, nil
 	})
+	r.Get("/api/knowledge-bases", s.listKnowledgeBases)
+	r.Post("/api/knowledge-bases", s.createKnowledgeBase)
+	r.Get("/api/knowledge-bases/{id}", s.getKnowledgeBase)
+	r.Put("/api/knowledge-bases/{id}", s.updateKnowledgeBase)
+	r.Post("/api/knowledge-bases/{id}/archive", s.archiveKnowledgeBase)
 	r.Put("/api/config/settings", s.updateSettings)
 	r.Post("/api/sources", s.uploadSource)
 	r.Get("/api/sources", s.listSources)
@@ -129,13 +141,12 @@ func (s *Server) Router() http.Handler {
 	r.Delete("/api/conversations/{id}", s.deleteConversation)
 	r.Post("/api/conversations/{id}/messages", s.sendMessage)
 	r.Post("/api/conversations/{id}/messages/stream", s.streamMessage)
-	return requestID(r)
+	return requestID(accessLog(s.knowledgeBaseScope(r)))
 }
 
 func (s *Server) reindex(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	indexer := s.Indexer
-	s.mu.RUnlock()
+	runtime, _ := runtimeFromContext(r.Context())
+	indexer := runtime.Indexer
 	result, err := indexer.Reindex(r.Context())
 	if err != nil {
 		writeJSONError(w, http.StatusUnprocessableEntity, err)
@@ -145,9 +156,8 @@ func (s *Server) reindex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) search(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	retriever := s.Retriever
-	s.mu.RUnlock()
+	runtime, _ := runtimeFromContext(r.Context())
+	retriever := runtime.Retriever
 	result, err := retriever.Search(r.Context(), r.URL.Query().Get("q"))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err)
@@ -159,7 +169,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getRetrievalTrace(w http.ResponseWriter, r *http.Request) {
 	var trace domain.RetrievalTrace
 	var raw string
-	err := s.DB.QueryRowContext(r.Context(), `SELECT trace_json FROM retrieval_traces WHERE id = ?`, chi.URLParam(r, "id")).Scan(&raw)
+	err := s.DB.QueryRowContext(r.Context(), `SELECT trace_json FROM retrieval_traces WHERE id = ? AND knowledge_base_id = ?`, chi.URLParam(r, "id"), knowledgebase.IDFromContext(r.Context())).Scan(&raw)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			writeJSONError(w, http.StatusNotFound, fmt.Errorf("retrieval trace not found"))
@@ -185,9 +195,8 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("question is required"))
 		return
 	}
-	s.mu.RLock()
-	service := s.Query
-	s.mu.RUnlock()
+	runtime, _ := runtimeFromContext(r.Context())
+	service := runtime.Query
 	result, err := service.Ask(r.Context(), request.Question)
 	if err != nil {
 		writeJSONError(w, http.StatusUnprocessableEntity, err)
@@ -205,7 +214,8 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&request)
 	}
-	conversation, err := s.Chat.Create(r.Context(), request.Title)
+	runtime, _ := runtimeFromContext(r.Context())
+	conversation, err := runtime.Chat.Create(r.Context(), request.Title)
 	if err != nil {
 		writeJSONError(w, http.StatusUnprocessableEntity, err)
 		return
@@ -214,7 +224,8 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
-	items, err := s.Chat.List(r.Context())
+	runtime, _ := runtimeFromContext(r.Context())
+	items, err := runtime.Chat.List(r.Context())
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err)
 		return
@@ -223,7 +234,8 @@ func (s *Server) listConversations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
-	detail, err := s.Chat.Get(r.Context(), chi.URLParam(r, "id"))
+	runtime, _ := runtimeFromContext(r.Context())
+	detail, err := runtime.Chat.Get(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		if err == sql.ErrNoRows {
 			writeJSONError(w, http.StatusNotFound, fmt.Errorf("conversation not found"))
@@ -236,7 +248,8 @@ func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
-	if err := s.Chat.Delete(r.Context(), chi.URLParam(r, "id")); err != nil {
+	runtime, _ := runtimeFromContext(r.Context())
+	if err := runtime.Chat.Delete(r.Context(), chi.URLParam(r, "id")); err != nil {
 		if err == sql.ErrNoRows {
 			writeJSONError(w, http.StatusNotFound, fmt.Errorf("conversation not found"))
 			return
@@ -253,9 +266,8 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("question is required"))
 		return
 	}
-	s.mu.RLock()
-	service := s.Chat
-	s.mu.RUnlock()
+	runtime, _ := runtimeFromContext(r.Context())
+	service := runtime.Chat
 	result, err := service.Send(r.Context(), chi.URLParam(r, "id"), request.Question)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -274,9 +286,8 @@ func (s *Server) streamMessage(w http.ResponseWriter, r *http.Request) {
 		writeSSEError(w, http.StatusBadRequest, fmt.Errorf("question is required"))
 		return
 	}
-	s.mu.RLock()
-	service := s.Chat
-	s.mu.RUnlock()
+	runtime, _ := runtimeFromContext(r.Context())
+	service := runtime.Chat
 	result, err := service.Send(r.Context(), chi.URLParam(r, "id"), request.Question)
 	if err != nil {
 		status := http.StatusUnprocessableEntity
@@ -307,8 +318,9 @@ func (s *Server) streamMessage(w http.ResponseWriter, r *http.Request) {
 
 func writeSSEError(w http.ResponseWriter, status int, err error) {
 	w.Header().Set("Content-Type", "text/event-stream")
+	errorValue := errorEnvelope(w, status, err)
 	w.WriteHeader(status)
-	payload, _ := json.Marshal(map[string]string{"error": err.Error()})
+	payload, _ := json.Marshal(map[string]any{"error": errorValue})
 	_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
 }
 
@@ -322,12 +334,11 @@ func (s *Server) createCompilation(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("document_id is required"))
 		return
 	}
-	s.mu.RLock()
-	service := s.Compiler
-	s.mu.RUnlock()
+	runtime, _ := runtimeFromContext(r.Context())
+	service := runtime.Compiler
 	result, err := service.Compile(r.Context(), request.DocumentID)
 	if err != nil {
-		writeJSON(w, http.StatusUnprocessableEntity, result)
+		writeJSONError(w, http.StatusUnprocessableEntity, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, result)
@@ -335,7 +346,8 @@ func (s *Server) createCompilation(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listCompilations(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	runs, err := s.Compiler.ListRuns(r.Context(), limit)
+	runtime, _ := runtimeFromContext(r.Context())
+	runs, err := runtime.Compiler.ListRuns(r.Context(), limit)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err)
 		return
@@ -344,7 +356,8 @@ func (s *Server) listCompilations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getCompilation(w http.ResponseWriter, r *http.Request) {
-	run, err := s.Compiler.GetRun(r.Context(), chi.URLParam(r, "id"))
+	runtime, _ := runtimeFromContext(r.Context())
+	run, err := runtime.Compiler.GetRun(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		if err == sql.ErrNoRows {
 			writeJSONError(w, http.StatusNotFound, fmt.Errorf("compilation run not found"))
@@ -357,10 +370,14 @@ func (s *Server) getCompilation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) retryCompilationRender(w http.ResponseWriter, r *http.Request) {
-	if err := s.Compiler.RetryRender(r.Context(), chi.URLParam(r, "id")); err != nil {
+	runtime, _ := runtimeFromContext(r.Context())
+	if err := runtime.Compiler.RetryRender(r.Context(), chi.URLParam(r, "id")); err != nil {
 		var pending *compiler.RenderPendingError
 		if errors.As(err, &pending) {
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"status": compiler.RunRenderPending, "error": err.Error()})
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"status": compiler.RunRenderPending,
+				"error":  errorEnvelope(w, http.StatusUnprocessableEntity, err),
+			})
 			return
 		}
 		if err == sql.ErrNoRows {
@@ -370,7 +387,7 @@ func (s *Server) retryCompilationRender(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, http.StatusUnprocessableEntity, err)
 		return
 	}
-	run, err := s.Compiler.GetRun(r.Context(), chi.URLParam(r, "id"))
+	run, err := runtime.Compiler.GetRun(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err)
 		return
@@ -394,7 +411,8 @@ func (s *Server) uploadSource(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("read source file: %w", err))
 		return
 	}
-	result, err := s.Sources.Ingest(r.Context(), sources.IngestInput{OriginalName: header.Filename, MediaType: header.Header.Get("Content-Type"), Data: data})
+	runtime, _ := runtimeFromContext(r.Context())
+	result, err := runtime.Sources.Ingest(r.Context(), sources.IngestInput{OriginalName: header.Filename, MediaType: header.Header.Get("Content-Type"), Data: data})
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err)
 		return
@@ -407,7 +425,8 @@ func (s *Server) uploadSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listSources(w http.ResponseWriter, r *http.Request) {
-	result, err := s.Sources.List(r.Context())
+	runtime, _ := runtimeFromContext(r.Context())
+	result, err := runtime.Sources.List(r.Context())
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err)
 		return
@@ -415,7 +434,8 @@ func (s *Server) listSources(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"sources": result})
 }
 func (s *Server) getSource(w http.ResponseWriter, r *http.Request) {
-	item, err := s.Sources.Get(r.Context(), chi.URLParam(r, "id"))
+	runtime, _ := runtimeFromContext(r.Context())
+	item, err := runtime.Sources.Get(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, err)
 		return
@@ -423,7 +443,8 @@ func (s *Server) getSource(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, item)
 }
 func (s *Server) getSourceChunks(w http.ResponseWriter, r *http.Request) {
-	result, err := s.Sources.Chunks(r.Context(), chi.URLParam(r, "id"))
+	runtime, _ := runtimeFromContext(r.Context())
+	result, err := runtime.Sources.Chunks(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err)
 		return
@@ -431,7 +452,8 @@ func (s *Server) getSourceChunks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"chunks": result})
 }
 func (s *Server) getSourceChunk(w http.ResponseWriter, r *http.Request) {
-	result, err := s.Sources.Chunk(r.Context(), chi.URLParam(r, "id"))
+	runtime, _ := runtimeFromContext(r.Context())
+	result, err := runtime.Sources.Chunk(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		if err == sql.ErrNoRows {
 			writeJSONError(w, http.StatusNotFound, fmt.Errorf("source chunk not found"))
@@ -443,7 +465,8 @@ func (s *Server) getSourceChunk(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 func (s *Server) getSourceWiki(w http.ResponseWriter, r *http.Request) {
-	result, err := s.Wiki.SourceTrace(r.Context(), chi.URLParam(r, "id"))
+	runtime, _ := runtimeFromContext(r.Context())
+	result, err := runtime.Wiki.SourceTrace(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		if err == sql.ErrNoRows {
 			writeJSONError(w, http.StatusNotFound, fmt.Errorf("source not found"))
@@ -455,7 +478,8 @@ func (s *Server) getSourceWiki(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 func (s *Server) listWikiPages(w http.ResponseWriter, r *http.Request) {
-	result, err := s.Wiki.ListPages(r.Context(), r.URL.Query().Get("type"))
+	runtime, _ := runtimeFromContext(r.Context())
+	result, err := runtime.Wiki.ListPages(r.Context(), r.URL.Query().Get("type"))
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err)
 		return
@@ -463,7 +487,8 @@ func (s *Server) listWikiPages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"pages": result})
 }
 func (s *Server) getWikiPage(w http.ResponseWriter, r *http.Request) {
-	result, err := s.Wiki.GetPage(r.Context(), chi.URLParam(r, "key"))
+	runtime, _ := runtimeFromContext(r.Context())
+	result, err := runtime.Wiki.GetPage(r.Context(), chi.URLParam(r, "key"))
 	if err != nil {
 		if err == sql.ErrNoRows {
 			writeJSONError(w, http.StatusNotFound, fmt.Errorf("wiki page not found"))
@@ -475,7 +500,8 @@ func (s *Server) getWikiPage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 func (s *Server) getWikiRevisions(w http.ResponseWriter, r *http.Request) {
-	result, err := s.Wiki.Revisions(r.Context(), chi.URLParam(r, "key"))
+	runtime, _ := runtimeFromContext(r.Context())
+	result, err := runtime.Wiki.Revisions(r.Context(), chi.URLParam(r, "key"))
 	if err != nil {
 		if err == sql.ErrNoRows {
 			writeJSONError(w, http.StatusNotFound, fmt.Errorf("wiki page not found"))
@@ -492,7 +518,8 @@ func (s *Server) getWikiRevisionDiff(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("revision must be a positive integer"))
 		return
 	}
-	result, err := s.Wiki.Diff(r.Context(), chi.URLParam(r, "key"), revision)
+	runtime, _ := runtimeFromContext(r.Context())
+	result, err := runtime.Wiki.Diff(r.Context(), chi.URLParam(r, "key"), revision)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			writeJSONError(w, http.StatusNotFound, fmt.Errorf("revision not found"))
@@ -504,7 +531,8 @@ func (s *Server) getWikiRevisionDiff(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 func (s *Server) lintWiki(w http.ResponseWriter, r *http.Request) {
-	issues, err := s.Wiki.Lint(r.Context())
+	runtime, _ := runtimeFromContext(r.Context())
+	issues, err := runtime.Wiki.Lint(r.Context())
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err)
 		return
@@ -517,7 +545,18 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 func writeJSONError(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]string{"error": err.Error()})
+	writeJSON(w, status, map[string]any{"error": errorEnvelope(w, status, err)})
+}
+
+func errorEnvelope(w http.ResponseWriter, status int, err error) map[string]string {
+	id := requestIDFromRequest(w)
+	code := errorCode(status)
+	message := logging.SafeSummary(err)
+	logging.Logger(context.Background()).Error("http handler failed", "status", status, "code", code, "error", logging.SafeDetail(err), "request_id", id)
+	if status >= http.StatusInternalServerError {
+		message = "internal server error; see server logs"
+	}
+	return map[string]string{"code": code, "message": message, "request_id": id}
 }
 
 func registerCoreSchemas(registry huma.Registry) {
@@ -560,6 +599,7 @@ type embeddingSettingsInput struct {
 type settingsInput struct {
 	LLM       llmSettingsInput       `json:"llm"`
 	Embedding embeddingSettingsInput `json:"embedding"`
+	Language  string                 `json:"language"`
 }
 
 func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
@@ -578,40 +618,61 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.mu.Lock()
-	previous := s.Config
-	next := s.Config
+	runtime, _ := runtimeFromContext(r.Context())
 	llmBaseURL, llmModel := strings.TrimSpace(input.LLM.Endpoint), strings.TrimSpace(input.LLM.Model)
-	next.CompilerEndpoint, next.CompilerModel, next.CompilerFakeFallback = llmBaseURL, llmModel, input.LLM.FakeFallback
-	next.ChatEndpoint, next.ChatModel, next.ChatFakeFallback = llmBaseURL, llmModel, input.LLM.FakeFallback
-	next.EmbeddingEndpoint, next.EmbeddingModel = strings.TrimSpace(input.Embedding.Endpoint), strings.TrimSpace(input.Embedding.Model)
-	if input.LLM.APIKey != "" {
-		next.CompilerLLMKey, next.ChatLLMKey = input.LLM.APIKey, input.LLM.APIKey
+	embeddingBaseURL, embeddingModel := strings.TrimSpace(input.Embedding.Endpoint), strings.TrimSpace(input.Embedding.Model)
+	apiKey := input.LLM.APIKey
+	if apiKey == "" {
+		apiKey = runtime.Effective.LLMAPIKey
 	}
-	if input.Embedding.BatchSize > 0 {
-		next.EmbeddingBatchSize = input.Embedding.BatchSize
+	language := input.Language
+	if language == "" {
+		language = runtime.KnowledgeBase.Language
 	}
-	values := storedSettings(next)
-	if err := config.SaveStored(r.Context(), s.DB, values); err != nil {
-		s.mu.Unlock()
+	updated, err := s.knowledgeBaseService().Update(r.Context(), runtime.KnowledgeBase.ID, knowledgebase.UpdateInput{
+		Name: runtime.KnowledgeBase.Name, Description: runtime.KnowledgeBase.Description, Language: language,
+		LLMBaseURL: llmBaseURL, LLMAPIKey: apiKey, LLMModel: llmModel,
+		EmbeddingBaseURL: embeddingBaseURL, EmbeddingModel: embeddingModel,
+	})
+	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err)
 		return
 	}
-	embeddingChanged := embeddingConfigChanged(previous, next)
-	s.applyProviderConfig(next)
+	// Keep the legacy default workspace graph hot-updated for callers that
+	// construct services directly. Non-default workspaces stay request-scoped.
+	if runtime.KnowledgeBase.ID == knowledgebase.DefaultID {
+		s.mu.Lock()
+		next := s.Config
+		next.CompilerEndpoint, next.CompilerLLMKey, next.CompilerModel = llmBaseURL, apiKey, llmModel
+		next.ChatEndpoint, next.ChatLLMKey, next.ChatModel = llmBaseURL, apiKey, llmModel
+		next.EmbeddingEndpoint, next.EmbeddingModel = embeddingBaseURL, embeddingModel
+		next.EmbeddingBatchSize = input.Embedding.BatchSize
+		s.applyProviderConfigLocked(next)
+		s.mu.Unlock()
+	}
+	embeddingChanged := runtime.Effective.EmbeddingBaseURL != embeddingBaseURL || runtime.Effective.EmbeddingModel != embeddingModel
 	if embeddingChanged {
-		if _, err := s.DB.ExecContext(r.Context(), `UPDATE wiki_pages SET index_status = 'index_pending' WHERE status = 'active'`); err != nil {
-			s.mu.Unlock()
+		if _, err := s.DB.ExecContext(r.Context(), `UPDATE wiki_pages SET index_status = 'index_pending' WHERE status = 'active' AND knowledge_base_id = ?`, runtime.KnowledgeBase.ID); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err)
 			return
 		}
 	}
-	settings, providers := publicSettings(s.Config), s.Config.ProviderStatus()
-	s.mu.Unlock()
+	nextRuntime, err := s.buildRuntime(r.Context(), updated.ID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	settings, providers := publicEffectiveSettings(nextRuntime), providerStatus(nextRuntime.Effective)
 	writeJSON(w, http.StatusOK, map[string]any{"settings": settings, "providers": providers, "reindex_required": embeddingChanged})
 }
 
 func (s *Server) applyProviderConfig(next config.Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applyProviderConfigLocked(next)
+}
+
+func (s *Server) applyProviderConfigLocked(next config.Config) {
 	var compilerLLM llm.LLMClient
 	if next.CompilerLLMConfigured() {
 		compilerLLM = llm.NewOpenAICompatible(next.CompilerEndpoint, next.CompilerLLMKey, next.CompilerModel, next.CompilerPromptDir)
@@ -641,7 +702,24 @@ func embeddingConfigChanged(previous, next config.Config) bool {
 func publicSettings(c config.Config) PublicSettings {
 	return PublicSettings{
 		LLM:       PublicLLMSettings{Endpoint: c.CompilerEndpoint, Model: c.CompilerModel, APIKeySet: c.CompilerLLMKey != "", FakeFallback: c.CompilerFakeFallback},
-		Embedding: PublicEmbeddingSettings{Endpoint: c.EmbeddingEndpoint, Model: c.EmbeddingModel, BatchSize: c.EmbeddingBatchSize},
+		Embedding: PublicEmbeddingSettings{Endpoint: c.EmbeddingEndpoint, Model: c.EmbeddingModel, BatchSize: c.EmbeddingBatchSize}, Language: knowledgebase.LanguageZH,
+	}
+}
+
+func publicEffectiveSettings(runtime requestRuntime) PublicSettings {
+	return PublicSettings{
+		LLM:       PublicLLMSettings{Endpoint: runtime.Effective.LLMBaseURL, Model: runtime.Effective.LLMModel, APIKeySet: runtime.Effective.LLMAPIKey != ""},
+		Embedding: PublicEmbeddingSettings{Endpoint: runtime.Effective.EmbeddingBaseURL, Model: runtime.Effective.EmbeddingModel, BatchSize: runtime.Indexer.BatchSize},
+		Language:  runtime.Effective.Language,
+	}
+}
+
+func providerStatus(value knowledgebase.EffectiveConfig) config.ProviderStatus {
+	llmConfigured := value.LLMBaseURL != "" && value.LLMAPIKey != "" && value.LLMModel != ""
+	return config.ProviderStatus{
+		CompilerLLM: config.Provider{Configured: llmConfigured, Endpoint: value.LLMBaseURL != "", Model: value.LLMModel},
+		ChatLLM:     config.Provider{Configured: llmConfigured, Endpoint: value.LLMBaseURL != "", Model: value.LLMModel},
+		Embedding:   config.Provider{Configured: value.EmbeddingBaseURL != "" && value.EmbeddingModel != "", Endpoint: value.EmbeddingBaseURL != "", Model: value.EmbeddingModel},
 	}
 }
 
@@ -663,6 +741,64 @@ func requestID(next http.Handler) http.Handler {
 			}
 		}
 		w.Header().Set("X-Request-ID", id)
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(logging.WithRequestID(r.Context(), id)))
 	})
+}
+
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *responseRecorder) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *responseRecorder) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *responseRecorder) Flush() {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *responseRecorder) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func accessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		recorder := &responseRecorder{ResponseWriter: w}
+		next.ServeHTTP(recorder, r)
+		status := recorder.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		logging.Logger(r.Context()).Info("http request", "method", r.Method, "path", r.URL.Path, "status", status, "duration_ms", logging.Duration(started))
+	})
+}
+
+func requestIDFromRequest(w http.ResponseWriter) string { return w.Header().Get("X-Request-ID") }
+
+func errorCode(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "bad_request"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusUnprocessableEntity:
+		return "unprocessable_entity"
+	case http.StatusInternalServerError:
+		return "internal_error"
+	default:
+		return fmt.Sprintf("http_%d", status)
+	}
 }

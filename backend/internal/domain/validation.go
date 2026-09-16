@@ -3,6 +3,7 @@ package domain
 import (
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 var safeSlugPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
@@ -26,77 +27,141 @@ func (s SourceChunk) Validate() error {
 
 func (p WikiPage) Validate() error {
 	if p.ID == "" || p.Slug == "" || p.Title == "" || p.Summary == "" {
-		return fmt.Errorf("wiki page requires id, slug, title, and summary")
+		return fmt.Errorf("invalid wiki page: id=%q slug=%q title=%q field=%q reason=%q", p.ID, p.Slug, diagnosticText(p.Title), firstEmptyWikiPageField(p), "required field is missing")
 	}
 	if !safeSlugPattern.MatchString(p.Slug) {
-		return fmt.Errorf("wiki page has invalid slug")
+		return fmt.Errorf("invalid wiki page: id=%q slug=%q title=%q field=%q value=%q constraint=%q reason=%q", p.ID, p.Slug, diagnosticText(p.Title), "slug", p.Slug, "^[a-z0-9]+(?:-[a-z0-9]+)*$", "must be a lowercase hyphen-separated slug")
 	}
-	if !validPageType(p.PageType) || !validPageStatus(p.Status) {
-		return fmt.Errorf("wiki page has invalid page_type or status")
+	if !validPageType(p.PageType) {
+		return fmt.Errorf("invalid wiki page: id=%q slug=%q title=%q field=%q value=%q constraint=%q reason=%q", p.ID, p.Slug, diagnosticText(p.Title), "page_type", p.PageType, "one of concept, entity, topic", "unsupported page type")
+	}
+	if !validPageStatus(p.Status) {
+		return fmt.Errorf("invalid wiki page: id=%q slug=%q title=%q field=%q value=%q constraint=%q reason=%q", p.ID, p.Slug, diagnosticText(p.Title), "status", p.Status, "one of active, merged, archived", "unsupported page status")
 	}
 	return nil
 }
 
 func (p CompilationPlan) Validate() error {
 	if p.DocumentID == "" || p.SchemaVersion == "" {
-		return fmt.Errorf("compilation plan requires document_id and schema_version")
+		field := "document_id"
+		if p.DocumentID != "" {
+			field = "schema_version"
+		}
+		return fmt.Errorf("invalid compilation plan: field=%q value=%q reason=%q", field, map[string]string{"document_id": p.DocumentID, "schema_version": p.SchemaVersion}[field], "required field is missing")
 	}
 	for i, page := range p.PageActions {
-		if !validPlanAction(page.Action) || page.Reason == "" {
-			return fmt.Errorf("page action %d has invalid action or missing reason", i)
+		prefix := pageActionDiagnostic(i, page)
+		if !validPlanAction(page.Action) {
+			return fmt.Errorf("%s field=%q value=%q constraint=%q reason=%q", prefix, "action", page.Action, "one of CREATE, UPDATE, MERGE, LINK, NO_OP", "unsupported plan action")
+		}
+		if strings.TrimSpace(page.Reason) == "" {
+			return fmt.Errorf("%s field=%q reason=%q", prefix, "reason", "must be non-empty")
 		}
 		if page.Action != ActionCreate && page.Action != ActionNoOp && page.TargetPageID == "" {
-			return fmt.Errorf("page action %d requires target_page_id", i)
+			return fmt.Errorf("%s field=%q reason=%q", prefix, "target_page_id", "required for this action")
 		}
 		if page.Action == ActionLink && page.SourcePageID == "" {
-			return fmt.Errorf("page action %d LINK requires source_page_id", i)
+			return fmt.Errorf("%s field=%q reason=%q", prefix, "source_page_id", "required for LINK")
 		}
 		if page.Action == ActionLink && page.Relation == "" {
-			return fmt.Errorf("page action %d LINK requires relation", i)
+			return fmt.Errorf("%s field=%q reason=%q", prefix, "relation", "required for LINK")
 		}
 		if page.Action == ActionLink && !validLinkRelation(page.Relation) {
-			return fmt.Errorf("page action %d LINK has invalid relation", i)
+			return fmt.Errorf("%s field=%q value=%q constraint=%q reason=%q", prefix, "relation", page.Relation, "one of related_to, part_of, depends_on, contradicts, supports, references", "unsupported link relation")
 		}
 		if page.Action == ActionLink && page.SourcePageID == page.TargetPageID {
-			return fmt.Errorf("page action %d LINK cannot target the same page", i)
+			return fmt.Errorf("%s field=%q value=%q reason=%q", prefix, "target_page_id", page.TargetPageID, "must differ from source_page_id")
 		}
 		if page.Action == ActionMerge && page.SourcePageID == "" {
-			return fmt.Errorf("page action %d MERGE requires source_page_id", i)
+			return fmt.Errorf("%s field=%q reason=%q", prefix, "source_page_id", "required for MERGE")
 		}
 		if page.Action == ActionMerge && page.SourcePageID == page.TargetPageID {
-			return fmt.Errorf("page action %d MERGE cannot target the same page", i)
+			return fmt.Errorf("%s field=%q value=%q reason=%q", prefix, "target_page_id", page.TargetPageID, "must differ from source_page_id")
 		}
 		if page.Action == ActionCreate && (page.Slug == "" || !safeSlugPattern.MatchString(page.Slug) || page.Title == "" || page.Summary == "" || !validPageType(page.PageType)) {
 			if page.Slug == "" || !safeSlugPattern.MatchString(page.Slug) {
-				return fmt.Errorf("page action %d create has invalid slug", i)
+				return fmt.Errorf("%s field=%q value=%q constraint=%q reason=%q", prefix, "slug", page.Slug, "^[a-z0-9]+(?:-[a-z0-9]+)*$", "invalid slug; must be a lowercase hyphen-separated slug")
 			}
-			return fmt.Errorf("page action %d create requires slug, title, summary, and valid page_type", i)
+			field := "title"
+			value := page.Title
+			reason := "must be non-empty"
+			if strings.TrimSpace(page.Title) == "" {
+				field, value = "title", page.Title
+			} else if strings.TrimSpace(page.Summary) == "" {
+				field, value = "summary", page.Summary
+			} else {
+				field, value, reason = "page_type", string(page.PageType), "must be one of concept, entity, topic"
+			}
+			return fmt.Errorf("%s field=%q value=%q reason=%q", prefix, field, diagnosticText(value), reason)
 		}
 		for j, claim := range page.ClaimActions {
-			if !validClaimAction(claim.Action) || claim.Text == "" {
-				return fmt.Errorf("claim action %d.%d has invalid action or missing text", i, j)
+			claimPrefix := claimActionDiagnostic(i, j, page, claim)
+			if !validClaimAction(claim.Action) {
+				return fmt.Errorf("%s field=%q value=%q constraint=%q reason=%q", claimPrefix, "action", claim.Action, "one of ADD, REVISE, RETAIN, MARK_DISPUTED, SUPERSEDE", "unsupported claim action")
+			}
+			if strings.TrimSpace(claim.Text) == "" {
+				return fmt.Errorf("%s field=%q reason=%q", claimPrefix, "text", "must be non-empty")
 			}
 			if claim.Action != "RETAIN" && len(claim.EvidenceChunkIDs) == 0 {
-				return fmt.Errorf("claim action %d.%d requires evidence", i, j)
+				return fmt.Errorf("%s field=%q value=%v reason=%q", claimPrefix, "evidence_chunk_ids", claim.EvidenceChunkIDs, "must contain at least one source chunk ID")
 			}
 			if (claim.Action == "REVISE" || claim.Action == "SUPERSEDE") && claim.TargetClaimID == "" && claim.PreviousText == "" {
-				return fmt.Errorf("claim action %d.%d requires target_claim_id or previous_text", i, j)
+				return fmt.Errorf("%s field=%q reason=%q", claimPrefix, "target_claim_id/previous_text", "one is required for REVISE or SUPERSEDE")
 			}
 			if claim.ClaimType != "" && !validClaimType(claim.ClaimType) {
-				return fmt.Errorf("claim action %d.%d has invalid claim_type", i, j)
+				return fmt.Errorf("%s field=%q value=%q constraint=%q reason=%q", claimPrefix, "claim_type", claim.ClaimType, "one of fact, definition, argument, procedure, caveat", "unsupported claim type")
 			}
 		}
 	}
 	return nil
 }
 
+func pageActionDiagnostic(index int, page PageAction) string {
+	return fmt.Sprintf("invalid page action: index=%d action=%q target_page_id=%q source_page_id=%q slug=%q title=%q", index, page.Action, page.TargetPageID, page.SourcePageID, page.Slug, diagnosticText(page.Title))
+}
+
+func claimActionDiagnostic(pageIndex, claimIndex int, page PageAction, claim ClaimAction) string {
+	return fmt.Sprintf("invalid claim action: page_index=%d claim_index=%d page_action=%q target_page_id=%q claim_type=%q text=%q evidence_chunk_ids=%v", pageIndex, claimIndex, page.Action, page.TargetPageID, claim.ClaimType, diagnosticText(claim.Text), claim.EvidenceChunkIDs)
+}
+
+func firstEmptyWikiPageField(page WikiPage) string {
+	if page.ID == "" {
+		return "id"
+	}
+	if page.Slug == "" {
+		return "slug"
+	}
+	if page.Title == "" {
+		return "title"
+	}
+	return "summary"
+}
+
+func diagnosticText(value string) string {
+	value = strings.Join(strings.Fields(value), " ")
+	const limit = 160
+	runes := []rune(value)
+	if len(runes) > limit {
+		return string(runes[:limit]) + "..."
+	}
+	return value
+}
+
 func (t RetrievalTrace) Validate() error {
 	if t.ID == "" || t.NormalizedQuery == "" {
-		return fmt.Errorf("retrieval trace requires id and normalized_query")
+		field := "id"
+		if t.ID != "" {
+			field = "normalized_query"
+		}
+		return fmt.Errorf("invalid retrieval trace: field=%q value=%q reason=%q", field, map[string]string{"id": t.ID, "normalized_query": t.NormalizedQuery}[field], "required field is missing")
 	}
-	for _, candidate := range t.Candidates {
+	for index, candidate := range t.Candidates {
 		if candidate.PageID == "" || candidate.PassageID == "" {
-			return fmt.Errorf("retrieval trace candidate requires page_id and passage_id")
+			field := "page_id"
+			if candidate.PageID != "" {
+				field = "passage_id"
+			}
+			return fmt.Errorf("invalid retrieval candidate: index=%d page_id=%q passage_id=%q field=%q value=%q reason=%q", index, candidate.PageID, candidate.PassageID, field, map[string]string{"page_id": candidate.PageID, "passage_id": candidate.PassageID}[field], "required field is missing")
 		}
 	}
 	return nil

@@ -15,16 +15,23 @@ import (
 
 	"github.com/joeychen/llm-wiki-demo/backend/internal/domain"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/indexing"
+	"github.com/joeychen/llm-wiki-demo/backend/internal/knowledgebase"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/llm"
+	"github.com/joeychen/llm-wiki-demo/backend/internal/logging"
 	chromem "github.com/philippgille/chromem-go"
 )
 
 type Service struct {
-	DB            *sql.DB
-	Embedder      llm.EmbeddingClient
-	TopK          int
-	ContextBudget int
-	IndexDir      string
+	DB              *sql.DB
+	Embedder        llm.EmbeddingClient
+	TopK            int
+	ContextBudget   int
+	IndexDir        string
+	KnowledgeBaseID string
+}
+
+func (s Service) scope(ctx context.Context) string {
+	return knowledgebase.Scope(ctx, s.KnowledgeBaseID)
 }
 
 type Candidate struct {
@@ -63,6 +70,7 @@ type Result struct {
 }
 
 func (s Service) Search(ctx context.Context, query string) (Result, error) {
+	started := time.Now()
 	normalized := indexing.Normalize(query)
 	if normalized == "" {
 		return Result{}, fmt.Errorf("query is required")
@@ -78,13 +86,18 @@ func (s Service) Search(ctx context.Context, query string) (Result, error) {
 	}
 	fts, err := s.fts(ctx, normalized, s.TopK*2)
 	if err != nil {
+		logging.Logger(ctx).Error("retrieval FTS failed", "query_length", len([]rune(normalized)), "error", logging.SafeSummary(err))
 		return Result{}, err
 	}
+	logging.Logger(ctx).Info("retrieval FTS completed", "candidates", len(fts))
 	vector, queryVector, err := s.vector(ctx, normalized, s.TopK*2)
 	if err != nil {
+		logging.Logger(ctx).Error("retrieval vector failed", "error", logging.SafeSummary(err))
 		return Result{}, err
 	}
+	logging.Logger(ctx).Info("retrieval vector completed", "candidates", len(vector))
 	merged := fuse(fts, vector)
+	logging.Logger(ctx).Info("retrieval RRF completed", "candidates", len(merged))
 	mergedCandidates := make([]Candidate, 0, len(merged))
 	for _, item := range merged {
 		mergedCandidates = append(mergedCandidates, item)
@@ -106,8 +119,10 @@ func (s Service) Search(ctx context.Context, query string) (Result, error) {
 	}
 	expanded, err := s.expand(ctx, seeds)
 	if err != nil {
+		logging.Logger(ctx).Error("retrieval Wiki expansion failed", "seeds", len(seeds), "error", logging.SafeSummary(err))
 		return Result{}, err
 	}
+	logging.Logger(ctx).Info("retrieval Wiki expansion completed", "seeds", len(seeds), "expanded", len(expanded))
 	for _, candidate := range expanded {
 		if existing, ok := merged[candidate.PageID]; ok {
 			if candidate.ExpansionScore > existing.ExpansionScore {
@@ -153,9 +168,11 @@ func (s Service) Search(ctx context.Context, query string) (Result, error) {
 	}
 	contextItems, fallbackIDs, err := s.context(ctx, candidates, queryVector, s.ContextBudget)
 	if err != nil {
+		logging.Logger(ctx).Error("retrieval context build failed", "candidates", len(candidates), "error", logging.SafeSummary(err))
 		return Result{}, err
 	}
-	trace := domain.RetrievalTrace{ID: traceID(normalized), NormalizedQuery: normalized, FTSCandidates: ids(fts), VectorCandidates: ids(vector), RRFScore: map[string]float64{}, ExpandedPages: []string{}, FinalCandidates: []string{}, DroppedCandidates: []string{}, ContextIDs: []string{}, ContextBudget: s.ContextBudget, SourceFallback: fallbackIDs, Candidates: []domain.RetrievalCandidateTrace{}, Notes: []string{"fts and vector search executed", "wiki passages are the primary retrieval object"}}
+	logging.Logger(ctx).Info("retrieval context completed", "candidates", len(candidates), "context_items", len(contextItems), "source_fallback", len(fallbackIDs))
+	trace := domain.RetrievalTrace{ID: traceID(s.scope(ctx), normalized), NormalizedQuery: normalized, FTSCandidates: ids(fts), VectorCandidates: ids(vector), RRFScore: map[string]float64{}, ExpandedPages: []string{}, FinalCandidates: []string{}, DroppedCandidates: []string{}, ContextIDs: []string{}, ContextBudget: s.ContextBudget, SourceFallback: fallbackIDs, Candidates: []domain.RetrievalCandidateTrace{}, Notes: []string{"fts and vector search executed", "wiki passages are the primary retrieval object"}}
 	for _, item := range merged {
 		trace.RRFScore[item.PageID] = item.RRFScore
 	}
@@ -203,8 +220,10 @@ func (s Service) Search(ctx context.Context, query string) (Result, error) {
 		trace.Notes = append(trace.Notes, "source chunks were used only as evidence fallback")
 	}
 	if err := s.saveTrace(ctx, trace); err != nil {
+		logging.Logger(ctx).Error("retrieval trace save failed", "trace_id", trace.ID, "error", logging.SafeSummary(err))
 		return Result{}, err
 	}
+	logging.Logger(ctx).Info("retrieval completed", "trace_id", trace.ID, "final_candidates", len(candidates), "context_items", len(contextItems), "duration_ms", logging.Duration(started))
 	return Result{Query: query, Candidates: candidates, Context: contextItems, Trace: trace}, nil
 }
 
@@ -216,7 +235,7 @@ type ranked struct {
 }
 
 func (s Service) fts(ctx context.Context, query string, limit int) ([]ranked, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT f.passage_id, f.page_id, bm25(wiki_fts) FROM wiki_fts f JOIN wiki_pages p ON p.id = f.page_id AND p.status = 'active' WHERE wiki_fts MATCH ? ORDER BY bm25(wiki_fts) LIMIT ?`, ftsQuery(query), limit)
+	rows, err := s.DB.QueryContext(ctx, `SELECT f.passage_id, f.page_id, bm25(wiki_fts) FROM wiki_fts f JOIN wiki_pages p ON p.id = f.page_id AND p.status = 'active' AND p.knowledge_base_id = f.knowledge_base_id WHERE wiki_fts MATCH ? AND f.knowledge_base_id = ? ORDER BY bm25(wiki_fts), f.passage_id LIMIT ?`, ftsQuery(query), s.scope(ctx), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +252,7 @@ func (s Service) fts(ctx context.Context, query string, limit int) ([]ranked, er
 	}
 	if len(result) == 0 {
 		rows.Close()
-		fallback, fallbackErr := s.DB.QueryContext(ctx, `SELECT w.id, w.page_id, 0.5 FROM wiki_passages w JOIN wiki_pages p ON p.id = w.page_id AND p.status = 'active' WHERE lower(w.title || ' ' || w.text) LIKE ? ORDER BY w.page_id LIMIT ?`, "%"+strings.ToLower(query)+"%", limit)
+		fallback, fallbackErr := s.DB.QueryContext(ctx, `SELECT w.id, w.page_id, 0.5 FROM wiki_passages w JOIN wiki_pages p ON p.id = w.page_id AND p.status = 'active' AND p.knowledge_base_id = w.knowledge_base_id WHERE w.knowledge_base_id = ? AND lower(w.title || ' ' || w.text) LIKE ? ORDER BY w.page_id LIMIT ?`, s.scope(ctx), "%"+strings.ToLower(query)+"%", limit)
 		if fallbackErr != nil {
 			return nil, fallbackErr
 		}
@@ -303,7 +322,7 @@ type storedVector struct {
 }
 
 func (s Service) sqliteWikiVectors(ctx context.Context) ([]storedVector, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT w.id, w.page_id, w.embedding_json FROM wiki_passages w JOIN wiki_pages p ON p.id = w.page_id AND p.status = 'active'`)
+	rows, err := s.DB.QueryContext(ctx, `SELECT w.id, w.page_id, w.embedding_json FROM wiki_passages w JOIN wiki_pages p ON p.id = w.page_id AND p.status = 'active' AND p.knowledge_base_id = w.knowledge_base_id WHERE w.knowledge_base_id = ?`, s.scope(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -380,7 +399,7 @@ func (s Service) queryVectorIndex(ctx context.Context, name string, query []floa
 }
 
 func (s Service) activePageIDs(ctx context.Context) (map[string]bool, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id FROM wiki_pages WHERE status = 'active'`)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id FROM wiki_pages WHERE status = 'active' AND knowledge_base_id = ?`, s.scope(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -428,7 +447,11 @@ func (s Service) expand(ctx context.Context, pageIDs []string) ([]Candidate, err
 	for i := range pageIDs {
 		args[i] = pageIDs[i]
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT l.source_page_id, l.target_page_id, p.id, target.slug, target.title, target.page_type, p.text FROM wiki_links l JOIN wiki_pages sp ON sp.id = l.source_page_id AND sp.status = 'active' JOIN wiki_pages tp ON tp.id = l.target_page_id AND tp.status = 'active' JOIN wiki_passages p ON p.page_id = CASE WHEN l.source_page_id IN (`+marks+`) THEN l.target_page_id ELSE l.source_page_id END JOIN wiki_pages target ON target.id = p.page_id AND target.status = 'active' WHERE l.relation != 'merged_into' AND (l.source_page_id IN (`+marks+`) OR l.target_page_id IN (`+marks+`))`, append(append(append([]any{}, args...), args...), args...)...)
+	queryArgs := append([]any{}, args...)
+	queryArgs = append(queryArgs, s.scope(ctx))
+	queryArgs = append(queryArgs, args...)
+	queryArgs = append(queryArgs, args...)
+	rows, err := s.DB.QueryContext(ctx, `SELECT l.source_page_id, l.target_page_id, p.id, target.slug, target.title, target.page_type, p.text FROM wiki_links l JOIN wiki_pages sp ON sp.id = l.source_page_id AND sp.status = 'active' AND sp.knowledge_base_id = l.knowledge_base_id JOIN wiki_pages tp ON tp.id = l.target_page_id AND tp.status = 'active' AND tp.knowledge_base_id = l.knowledge_base_id JOIN wiki_passages p ON p.page_id = CASE WHEN l.source_page_id IN (`+marks+`) THEN l.target_page_id ELSE l.source_page_id END AND p.knowledge_base_id = l.knowledge_base_id JOIN wiki_pages target ON target.id = p.page_id AND target.status = 'active' AND target.knowledge_base_id = l.knowledge_base_id WHERE l.knowledge_base_id = ? AND l.relation != 'merged_into' AND (l.source_page_id IN (`+marks+`) OR l.target_page_id IN (`+marks+`))`, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -465,7 +488,7 @@ func (s Service) expand(ctx context.Context, pageIDs []string) ([]Candidate, err
 func (s Service) hydrateCandidates(ctx context.Context, candidates map[string]Candidate) error {
 	for pageID, candidate := range candidates {
 		var slug, title, pageType, text string
-		err := s.DB.QueryRowContext(ctx, `SELECT p.slug, p.title, p.page_type, w.text FROM wiki_pages p JOIN wiki_passages w ON w.page_id = p.id WHERE p.id = ? AND p.status = 'active' ORDER BY w.id LIMIT 1`, pageID).Scan(&slug, &title, &pageType, &text)
+		err := s.DB.QueryRowContext(ctx, `SELECT p.slug, p.title, p.page_type, w.text FROM wiki_pages p JOIN wiki_passages w ON w.page_id = p.id AND w.knowledge_base_id = p.knowledge_base_id WHERE p.id = ? AND p.status = 'active' AND p.knowledge_base_id = ? ORDER BY w.id LIMIT 1`, pageID, s.scope(ctx)).Scan(&slug, &title, &pageType, &text)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				delete(candidates, pageID)
@@ -495,7 +518,7 @@ func (s Service) context(ctx context.Context, candidates []Candidate, queryVecto
 		result = append(result, ContextItem{ID: candidate.PassageID, Kind: "wiki", PageID: candidate.PageID, PassageID: candidate.PassageID, Text: text, Citation: candidate.Slug})
 		used += cost
 		candidateEvidenceAdded := false
-		rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT ce.source_chunk_id, sc.text FROM wiki_claims c JOIN claim_evidence ce ON ce.claim_id = c.id JOIN source_chunks sc ON sc.id = ce.source_chunk_id WHERE c.page_id = ? AND c.status IN ('active','disputed') ORDER BY ce.source_chunk_id`, candidate.PageID)
+		rows, err := s.DB.QueryContext(ctx, `SELECT DISTINCT ce.source_chunk_id, sc.text FROM wiki_claims c JOIN claim_evidence ce ON ce.claim_id = c.id AND ce.knowledge_base_id = c.knowledge_base_id JOIN source_chunks sc ON sc.id = ce.source_chunk_id AND sc.knowledge_base_id = c.knowledge_base_id WHERE c.page_id = ? AND c.knowledge_base_id = ? AND c.status IN ('active','disputed') ORDER BY ce.source_chunk_id`, candidate.PageID, s.scope(ctx))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -587,7 +610,7 @@ func (s Service) sourceFallback(ctx context.Context, queryVector []float32, limi
 		}
 		return matches, nil
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT source_chunk_id, embedding_json FROM source_chunk_embeddings`)
+	rows, err := s.DB.QueryContext(ctx, `SELECT source_chunk_id, embedding_json FROM source_chunk_embeddings WHERE knowledge_base_id = ?`, s.scope(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -619,7 +642,7 @@ func (s Service) sourceFallback(ctx context.Context, queryVector []float32, limi
 		matches = matches[:limit]
 	}
 	for i := range matches {
-		if err := s.DB.QueryRowContext(ctx, `SELECT text FROM source_chunks WHERE id = ?`, matches[i].ID).Scan(&matches[i].Text); err != nil {
+		if err := s.DB.QueryRowContext(ctx, `SELECT text FROM source_chunks WHERE id = ? AND knowledge_base_id = ?`, matches[i].ID, s.scope(ctx)).Scan(&matches[i].Text); err != nil {
 			return nil, err
 		}
 	}
@@ -631,7 +654,7 @@ func (s Service) saveTrace(ctx context.Context, trace domain.RetrievalTrace) err
 	if err != nil {
 		return err
 	}
-	_, err = s.DB.ExecContext(ctx, `INSERT INTO retrieval_traces (id, normalized_query, trace_json, created_at) VALUES (?, ?, ?, ?)`, trace.ID, trace.NormalizedQuery, string(raw), time.Now().UTC().Format(time.RFC3339Nano))
+	_, err = s.DB.ExecContext(ctx, `INSERT INTO retrieval_traces (id, knowledge_base_id, normalized_query, trace_json, created_at) VALUES (?, ?, ?, ?, ?)`, trace.ID, s.scope(ctx), trace.NormalizedQuery, string(raw), time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 func ids(items []ranked) []string {
@@ -655,7 +678,7 @@ func maxFloat(a, b float64) float64 {
 	}
 	return b
 }
-func traceID(query string) string {
-	sum := sha256.Sum256([]byte(query + time.Now().UTC().Format(time.RFC3339Nano)))
+func traceID(scope, query string) string {
+	sum := sha256.Sum256([]byte(scope + ":" + query + time.Now().UTC().Format(time.RFC3339Nano)))
 	return "trace_" + hex.EncodeToString(sum[:])
 }

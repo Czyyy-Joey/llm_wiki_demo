@@ -1,10 +1,14 @@
+import { getSelectedKnowledgeBaseID } from './scope'
+
 export type ProviderStatus = { configured: boolean; endpoint_configured: boolean; model?: string }
 export type HealthResponse = { status: string; database: string; providers: { compiler_llm: ProviderStatus; chat_llm: ProviderStatus; embedding: ProviderStatus } }
 export type LLMSettings = { base_url: string; model: string; api_key_set: boolean; fake_fallback?: boolean }
 export type EmbeddingSettings = { base_url: string; model: string; batch_size?: number }
-export type Settings = { llm: LLMSettings; embedding: EmbeddingSettings }
+export type Settings = { llm: LLMSettings; embedding: EmbeddingSettings; language: 'zh' | 'en' }
 export type ConfigStatus = { providers: HealthResponse['providers']; settings: Settings }
-export type SettingsInput = { llm: { base_url: string; model: string; api_key: string; fake_fallback: boolean }; embedding: { base_url: string; model: string; batch_size: number } }
+export type SettingsInput = { llm: { base_url: string; model: string; api_key: string; fake_fallback: boolean }; embedding: { base_url: string; model: string; batch_size: number }; language: 'zh' | 'en' }
+export type KnowledgeBase = { id: string; name: string; description: string; status: 'active' | 'archived'; language: 'zh' | 'en'; llm_base_url?: string; llm_model?: string; llm_api_key_set: boolean; embedding_base_url?: string; embedding_model?: string; created_at: string; updated_at: string }
+export type KnowledgeBaseInput = { name: string; description: string; language: 'zh' | 'en' }
 export type PageType = 'concept' | 'entity' | 'topic'
 export type WikiPage = { id: string; slug: string; page_type: PageType; title: string; summary: string; status: string; current_revision: number; updated_at: string }
 export type WikiPageListItem = WikiPage & { claim_count: number; source_count: number; link_count: number }
@@ -34,23 +38,64 @@ export type SourceWikiTrace = { source: SourceDocument; chunk_count: number; cla
 export type CompilationPlan = { document_id: string; page_actions: Array<{ action: string; target_page_id?: string; source_page_id?: string; slug?: string; page_type?: string; title?: string; reason: string; claim_actions?: Array<{ action: string; text: string; evidence_chunk_ids: string[] }> }> }
 export type CompilationRun = { id: string; document_id: string; status: string; analyze?: { summary?: string; topics?: Array<{ key: string; title: string; page_type: string; claims: unknown[] }> }; candidates?: Array<{ topic_key: string; page_id: string; title: string; score: number }>; plan?: CompilationPlan; validation?: { valid: boolean; error?: string }; apply_result?: Record<string, unknown>; diff?: { pages?: Array<Record<string, unknown>>; added_claims?: string[]; changed_claims?: string[]; removed_claims?: string[] } | Record<string, unknown>; model?: string; prompt_version?: string; error?: string; created_at: string }
 
+type ErrorDetail = { code?: string; message?: string; request_id?: string }
+type ErrorPayload = { error?: ErrorDetail | string }
+
+function errorMessage(payload: ErrorPayload | null, fallback: string): string {
+  const error = payload?.error
+  const message = typeof error === 'string' ? error : error?.message
+  const requestID = typeof error === 'object' ? error?.request_id : undefined
+  return `${message || fallback}${requestID ? ` (request_id: ${requestID})` : ''}`
+}
+
+function sseErrorPayload(raw: string): ErrorPayload | null {
+  const data = raw.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n')
+  if (!data) return null
+  try {
+    return JSON.parse(data) as ErrorPayload
+  } catch {
+    return null
+  }
+}
+
 async function getJSON<T>(path: string): Promise<T> {
-  const response = await fetch(path)
-  if (!response.ok) throw new Error(`Request failed: ${response.status}`)
+  const response = await fetch(path, { headers: scopedHeaders() })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as ErrorPayload | null
+    throw new Error(errorMessage(payload, `Request failed: ${response.status}`))
+  }
   return await response.json() as T
 }
 
 async function sendJSON<T>(path: string, method: string, body: unknown): Promise<T> {
-  const response = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+  const response = await fetch(path, { method, headers: scopedHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(body) })
   if (!response.ok) {
-    const payload = await response.json().catch(() => null) as { error?: string } | null
-    throw new Error(payload?.error || `Request failed: ${response.status}`)
+    const payload = await response.json().catch(() => null) as ErrorPayload | null
+    throw new Error(errorMessage(payload, `Request failed: ${response.status}`))
   }
   return await response.json() as T
 }
 
 export async function getHealth(): Promise<HealthResponse> {
   return getJSON<HealthResponse>('/api/health')
+}
+
+function scopedHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return { 'X-Knowledge-Base-ID': getSelectedKnowledgeBaseID(), ...extra }
+}
+
+export async function getKnowledgeBases(): Promise<KnowledgeBase[]> {
+  const response = await getJSON<{ knowledge_bases: KnowledgeBase[] }>('/api/knowledge-bases')
+  return response.knowledge_bases ?? []
+}
+export function createKnowledgeBase(input: KnowledgeBaseInput): Promise<KnowledgeBase> { return postJSON('/api/knowledge-bases', input) }
+export function updateKnowledgeBase(id: string, input: KnowledgeBaseInput): Promise<KnowledgeBase> { return sendJSON(`/api/knowledge-bases/${encodeURIComponent(id)}`, 'PUT', input) }
+export async function archiveKnowledgeBase(id: string): Promise<void> {
+  const response = await fetch(`/api/knowledge-bases/${encodeURIComponent(id)}/archive`, { method: 'POST', headers: scopedHeaders() })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as ErrorPayload | null
+    throw new Error(errorMessage(payload, `Request failed: ${response.status}`))
+  }
 }
 
 export function getConfig(): Promise<ConfigStatus> { return getJSON('/api/config/status') }
@@ -65,10 +110,10 @@ export async function getSources(): Promise<SourceDocument[]> {
 export async function uploadSource(file: File): Promise<SourceUpload> {
   const body = new FormData()
   body.append('file', file)
-  const response = await fetch('/api/sources', { method: 'POST', body })
+  const response = await fetch('/api/sources', { method: 'POST', headers: scopedHeaders(), body })
   if (!response.ok) {
-    const payload = await response.json().catch(() => null) as { error?: string } | null
-    throw new Error(payload?.error || `Upload failed: ${response.status}`)
+    const payload = await response.json().catch(() => null) as ErrorPayload | null
+    throw new Error(errorMessage(payload, `Upload failed: ${response.status}`))
   }
   return await response.json() as SourceUpload
 }
@@ -131,10 +176,14 @@ export function sendMessage(id: string, question: string): Promise<ChatTurnResul
 export async function streamMessage(id: string, question: string, onDelta: (delta: string) => void): Promise<ChatTurnResult> {
   const response = await fetch(`/api/conversations/${encodeURIComponent(id)}/messages/stream`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    headers: scopedHeaders({ 'Content-Type': 'application/json', Accept: 'text/event-stream' }),
     body: JSON.stringify({ question }),
   })
-  if (!response.ok || !response.body) throw new Error(`Request failed: ${response.status}`)
+  if (!response.ok) {
+    const payload = sseErrorPayload(await response.text().catch(() => ''))
+    throw new Error(errorMessage(payload, `Request failed: ${response.status}`))
+  }
+  if (!response.body) throw new Error(`Request failed: ${response.status}`)
 
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -144,10 +193,10 @@ export async function streamMessage(id: string, question: string, onDelta: (delt
     const event = block.split('\n').find(line => line.startsWith('event:'))?.slice(6).trim()
     const data = block.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n')
     if (!event || !data) return
-    const payload = JSON.parse(data) as { delta?: string; error?: string } | ChatTurnResult
+    const payload = JSON.parse(data) as { delta?: string } | ErrorPayload | ChatTurnResult
     if (event === 'message' && 'delta' in payload && payload.delta) onDelta(payload.delta)
     if (event === 'done') completed = payload as ChatTurnResult
-    if (event === 'error') throw new Error('error' in payload ? payload.error : 'Stream failed')
+    if (event === 'error') throw new Error(errorMessage(payload as ErrorPayload, 'Stream failed'))
   }
 
   while (true) {

@@ -14,7 +14,9 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/joeychen/llm-wiki-demo/backend/internal/knowledgebase"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/llm"
+	"github.com/joeychen/llm-wiki-demo/backend/internal/logging"
 	chromem "github.com/philippgille/chromem-go"
 )
 
@@ -30,12 +32,17 @@ func ProviderIdentity(endpoint, model string) string {
 }
 
 type Service struct {
-	DB         *sql.DB
-	Embedder   llm.EmbeddingClient
-	Model      string
-	ProviderID string
-	BatchSize  int
-	IndexDir   string
+	DB              *sql.DB
+	Embedder        llm.EmbeddingClient
+	Model           string
+	ProviderID      string
+	BatchSize       int
+	IndexDir        string
+	KnowledgeBaseID string
+}
+
+func (s Service) scope(ctx context.Context) string {
+	return knowledgebase.Scope(ctx, s.KnowledgeBaseID)
 }
 
 type Passage struct {
@@ -57,6 +64,8 @@ type IndexResult struct {
 }
 
 func (s Service) Reindex(ctx context.Context) (IndexResult, error) {
+	started := time.Now()
+	logging.Logger(ctx).Info("index reindex started", "provider_id", s.ProviderID, "model", s.Model)
 	if s.DB == nil {
 		return IndexResult{}, fmt.Errorf("index database is nil")
 	}
@@ -102,46 +111,49 @@ func (s Service) Reindex(ctx context.Context) (IndexResult, error) {
 		return IndexResult{}, err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `DELETE FROM wiki_fts`); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM wiki_fts WHERE knowledge_base_id = ?`, s.scope(ctx)); err != nil {
 		return IndexResult{}, err
 	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM wiki_passages`); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM wiki_passages WHERE knowledge_base_id = ?`, s.scope(ctx)); err != nil {
 		return IndexResult{}, err
 	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM source_chunk_embeddings`); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM source_chunk_embeddings WHERE knowledge_base_id = ?`, s.scope(ctx)); err != nil {
 		return IndexResult{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, passage := range passages {
 		encoded, _ := json.Marshal(passage.Embedding)
-		if _, err = tx.ExecContext(ctx, `INSERT INTO wiki_passages (id, page_id, section_id, title, heading_path, text, page_type, revision, content_hash, embedding_json, embedding_model, indexed_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, passage.ID, passage.PageID, passage.Title, passage.HeadingPath, passage.Text, passage.PageType, passage.Revision, passage.ContentHash, string(encoded), s.ProviderID, now); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO wiki_passages (id, knowledge_base_id, page_id, section_id, title, heading_path, text, page_type, revision, content_hash, embedding_json, embedding_model, indexed_at) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, passage.ID, s.scope(ctx), passage.PageID, passage.Title, passage.HeadingPath, passage.Text, passage.PageType, passage.Revision, passage.ContentHash, string(encoded), s.ProviderID, now); err != nil {
 			return IndexResult{}, err
 		}
 		ftsTitle := strings.Join(Tokenize(passage.Title), " ")
 		ftsText := strings.Join(Tokenize(passage.Text), " ")
-		if _, err = tx.ExecContext(ctx, `INSERT INTO wiki_fts (passage_id, page_id, title, text) VALUES (?, ?, ?, ?)`, passage.ID, passage.PageID, ftsTitle, ftsText); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO wiki_fts (knowledge_base_id, passage_id, page_id, title, text) VALUES (?, ?, ?, ?, ?)`, s.scope(ctx), passage.ID, passage.PageID, ftsTitle, ftsText); err != nil {
 			return IndexResult{}, err
 		}
 	}
 	for _, chunk := range chunks {
 		encoded, _ := json.Marshal(chunk.Embedding)
-		if _, err = tx.ExecContext(ctx, `INSERT INTO source_chunk_embeddings (source_chunk_id, content_hash, embedding_json, embedding_model, indexed_at) VALUES (?, ?, ?, ?, ?)`, chunk.ID, chunk.ContentHash, string(encoded), s.ProviderID, now); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO source_chunk_embeddings (source_chunk_id, knowledge_base_id, content_hash, embedding_json, embedding_model, indexed_at) VALUES (?, ?, ?, ?, ?, ?)`, chunk.ID, s.scope(ctx), chunk.ContentHash, string(encoded), s.ProviderID, now); err != nil {
 			return IndexResult{}, err
 		}
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE wiki_pages SET index_status = 'index_pending' WHERE status = 'active'`); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE wiki_pages SET index_status = 'index_pending' WHERE status = 'active' AND knowledge_base_id = ?`, s.scope(ctx)); err != nil {
 		return IndexResult{}, err
 	}
 	if err = tx.Commit(); err != nil {
 		return IndexResult{}, err
 	}
 	if err := s.writeVectorIndexes(ctx, passages, chunks); err != nil {
+		logging.Logger(ctx).Error("index vector write failed", "wiki_passages", len(passages), "source_chunks", len(chunks), "duration_ms", logging.Duration(started), "error", logging.SafeSummary(err))
 		return IndexResult{}, err
 	}
-	if _, err = s.DB.ExecContext(ctx, `UPDATE wiki_pages SET index_status = 'clean' WHERE status = 'active'`); err != nil {
+	if _, err = s.DB.ExecContext(ctx, `UPDATE wiki_pages SET index_status = 'clean' WHERE status = 'active' AND knowledge_base_id = ?`, s.scope(ctx)); err != nil {
 		return IndexResult{}, err
 	}
-	return IndexResult{WikiPassages: len(passages), SourceChunks: len(chunks), EmbeddingsMade: made}, nil
+	result := IndexResult{WikiPassages: len(passages), SourceChunks: len(chunks), EmbeddingsMade: made}
+	logging.Logger(ctx).Info("index reindex completed", "wiki_passages", result.WikiPassages, "source_chunks", result.SourceChunks, "embeddings_made", result.EmbeddingsMade, "duration_ms", logging.Duration(started))
+	return result, nil
 }
 
 // writeVectorIndexes builds chromem-go in a staging directory and swaps it into
@@ -241,7 +253,7 @@ func (s Service) fillEmbeddings(ctx context.Context, work []embeddable, source b
 				table = "source_chunk_embeddings"
 				idColumn = "source_chunk_id"
 			}
-			_ = s.DB.QueryRow(`SELECT content_hash, embedding_model, embedding_json FROM `+table+` WHERE `+idColumn+` = ?`, work[i].ID).Scan(&hash, &oldModel, &oldJSON)
+			_ = s.DB.QueryRow(`SELECT content_hash, embedding_model, embedding_json FROM `+table+` WHERE `+idColumn+` = ? AND knowledge_base_id = ?`, work[i].ID, s.scope(ctx)).Scan(&hash, &oldModel, &oldJSON)
 			if hash == work[i].ContentHash && oldModel == model && oldJSON.Valid {
 				_ = json.Unmarshal([]byte(oldJSON.String), &work[i].Embedding)
 				continue
@@ -303,8 +315,8 @@ type SourceChunk struct {
 
 func (s Service) loadPassages(ctx context.Context) ([]Passage, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT p.id, p.slug, p.title, p.summary, p.page_type, p.current_revision,
-		COALESCE((SELECT GROUP_CONCAT(text, char(10)) FROM (SELECT c.text FROM wiki_claims c WHERE c.page_id = p.id AND c.status IN ('active', 'disputed') ORDER BY c.id)), '')
-		FROM wiki_pages p WHERE p.status = 'active' ORDER BY p.slug`)
+		COALESCE((SELECT GROUP_CONCAT(text, char(10)) FROM (SELECT c.text FROM wiki_claims c WHERE c.page_id = p.id AND c.knowledge_base_id = p.knowledge_base_id AND c.status IN ('active', 'disputed') ORDER BY c.id)), '')
+		FROM wiki_pages p WHERE p.status = 'active' AND p.knowledge_base_id = ? ORDER BY p.slug`, s.scope(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -318,7 +330,7 @@ func (s Service) loadPassages(ctx context.Context) ([]Passage, error) {
 		}
 		// A page has one stable passage in the demo. Revision changes the
 		// content, not the identity of the indexed passage.
-		p.ID = "passage_" + stableHash(p.PageID+":page")
+		p.ID = "passage_" + stableHash(s.scope(ctx)+":"+p.PageID+":page")
 		p.HeadingPath = p.Title
 		p.Text = strings.TrimSpace(strings.Join([]string{summary, claims}, "\n"))
 		p.ContentHash = stableHash(p.Title + "\n" + p.Text + "\n" + p.PageType)
@@ -328,7 +340,7 @@ func (s Service) loadPassages(ctx context.Context) ([]Passage, error) {
 }
 
 func (s Service) loadChunks(ctx context.Context) ([]SourceChunk, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, text, content_hash FROM source_chunks ORDER BY id`)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, text, content_hash FROM source_chunks WHERE knowledge_base_id = ? ORDER BY id`, s.scope(ctx))
 	if err != nil {
 		return nil, err
 	}

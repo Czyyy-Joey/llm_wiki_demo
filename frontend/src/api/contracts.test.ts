@@ -1,7 +1,21 @@
 import { describe, expect, it, vi } from 'vitest'
-import { getHealth, getWikiPage, getWikiPages, getWikiRevisions, searchWiki } from './contracts'
+import { getHealth, getWikiPage, getWikiPages, getWikiRevisions, searchWiki, streamMessage } from './contracts'
 
 describe('API contracts', () => { it('reads the backend response body directly', async () => { vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ status: 'ok', database: 'ok', providers: { compiler_llm: { configured: false, endpoint_configured: false }, embedding: { configured: false, endpoint_configured: false } } }) })); await expect(getHealth()).resolves.toMatchObject({ status: 'ok', database: 'ok' }); vi.unstubAllGlobals() }) })
+
+describe('API errors', () => {
+  it('surfaces the backend diagnostic message and request ID', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 422, json: async () => ({ error: { code: 'unprocessable_entity', message: 'provider unavailable', request_id: 'req-ui-test' } }) }))
+    await expect(getHealth()).rejects.toThrow('provider unavailable (request_id: req-ui-test)')
+    vi.unstubAllGlobals()
+  })
+
+  it('surfaces request IDs from non-success SSE responses', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404, text: async () => 'event: error\ndata: {"error":{"code":"not_found","message":"conversation not found","request_id":"req-sse-ui"}}\n\n' }))
+    await expect(streamMessage('missing', 'hello', () => undefined)).rejects.toThrow('conversation not found (request_id: req-sse-ui)')
+    vi.unstubAllGlobals()
+  })
+})
 
 describe('Wiki API contracts', () => {
   it('unwraps the real page list and revision response wrappers', async () => {
@@ -11,8 +25,8 @@ describe('Wiki API contracts', () => {
     vi.stubGlobal('fetch', fetchMock)
     await expect(getWikiPages('topic')).resolves.toHaveLength(1)
     await expect(getWikiRevisions('topic')).resolves.toHaveLength(1)
-    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/wiki/pages?type=topic')
-    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/wiki/pages/topic/revisions')
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/wiki/pages?type=topic', { headers: { 'X-Knowledge-Base-ID': 'default' } })
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/wiki/pages/topic/revisions', { headers: { 'X-Knowledge-Base-ID': 'default' } })
     vi.unstubAllGlobals()
   })
 
@@ -32,7 +46,7 @@ describe('Wiki API contracts', () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => payload })
     vi.stubGlobal('fetch', fetchMock)
     await expect(searchWiki('semantic search')).resolves.toMatchObject({ candidates: [{ vector_score: 0.8 }], trace: { id: 'trace-1' } })
-    expect(fetchMock).toHaveBeenCalledWith('/api/retrieval/search?q=semantic%20search')
+    expect(fetchMock).toHaveBeenCalledWith('/api/retrieval/search?q=semantic%20search', { headers: { 'X-Knowledge-Base-ID': 'default' } })
     vi.unstubAllGlobals()
   })
 })
