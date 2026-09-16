@@ -182,6 +182,12 @@ func (s Service) Compile(ctx context.Context, documentID string) (Result, error)
 		return Result{RunID: runID, Status: RunRenderPending}, err
 	}
 	logging.Logger(ctx).Info("compilation applied", "run_id", runID, "pages", len(diff.Pages), "claims_added", diff.ClaimsAdded, "links_added", diff.LinksAdded, "duration_ms", logging.Duration(started))
+	stage = "relate"
+	if related, relateErr := s.RelateAll(ctx, runID); relateErr != nil {
+		logging.Logger(ctx).Error("cross-page relate failed", "run_id", runID, "error", logging.SafeSummary(relateErr))
+	} else if related > 0 {
+		logging.Logger(ctx).Info("cross-page relate completed", "run_id", runID, "links_added", related)
+	}
 	return Result{RunID: runID, Status: RunApplied}, nil
 }
 
@@ -275,6 +281,48 @@ func rawOrNil(value sql.NullString) json.RawMessage {
 	return json.RawMessage(value.String)
 }
 
+// planCreatedSlugs collects the slugs of pages a plan creates. LINK and MERGE
+// actions may reference these slugs to relate pages born in the same run,
+// before those pages have database IDs.
+func planCreatedSlugs(plan domain.CompilationPlan) map[string]bool {
+	slugs := make(map[string]bool)
+	for _, action := range plan.PageActions {
+		if action.Action == domain.ActionCreate && action.Slug != "" {
+			slugs[action.Slug] = true
+		}
+	}
+	return slugs
+}
+
+// resolvePageRef maps a plan page reference to a stored page ID. A reference
+// matching a slug created in the same plan resolves to that page's
+// deterministic ID (identical to what ActionCreate assigns); any other
+// reference is treated as an existing page ID and returned unchanged.
+func (s Service) resolvePageRef(ctx context.Context, ref string, created map[string]bool) string {
+	if ref != "" && created[ref] {
+		return newID("page", s.scope(ctx)+":"+ref)
+	}
+	return ref
+}
+
+// createsFirst returns the actions with every CREATE ordered ahead of the
+// rest, preserving relative order within each group. This lets a later LINK or
+// MERGE reference a page the same plan creates.
+func createsFirst(actions []domain.PageAction) []domain.PageAction {
+	ordered := make([]domain.PageAction, 0, len(actions))
+	for _, action := range actions {
+		if action.Action == domain.ActionCreate {
+			ordered = append(ordered, action)
+		}
+	}
+	for _, action := range actions {
+		if action.Action != domain.ActionCreate {
+			ordered = append(ordered, action)
+		}
+	}
+	return ordered
+}
+
 func (s Service) ValidatePlan(ctx context.Context, plan domain.CompilationPlan, documentID string) error {
 	if err := plan.Validate(); err != nil {
 		return err
@@ -282,6 +330,7 @@ func (s Service) ValidatePlan(ctx context.Context, plan domain.CompilationPlan, 
 	if plan.DocumentID != documentID {
 		return fmt.Errorf("invalid compilation plan: field=%q value=%q constraint=%q reason=%q", "document_id", plan.DocumentID, fmt.Sprintf("must match %q", documentID), "document ID mismatch")
 	}
+	created := planCreatedSlugs(plan)
 	for i, action := range plan.PageActions {
 		pagePrefix := fmt.Sprintf("invalid page action: index=%d action=%q target_page_id=%q source_page_id=%q slug=%q title=%q", i, action.Action, action.TargetPageID, action.SourcePageID, action.Slug, diagnosticText(action.Title))
 		var count int
@@ -292,7 +341,7 @@ func (s Service) ValidatePlan(ctx context.Context, plan domain.CompilationPlan, 
 			if count != 0 {
 				return fmt.Errorf("%s field=%q value=%q reason=%q", pagePrefix, "slug", action.Slug, "already exists")
 			}
-		} else if action.Action != domain.ActionNoOp {
+		} else if action.Action != domain.ActionNoOp && !created[action.TargetPageID] {
 			if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM wiki_pages WHERE id = ? AND knowledge_base_id = ?`, action.TargetPageID, s.scope(ctx)).Scan(&count); err != nil {
 				return err
 			}
@@ -300,7 +349,7 @@ func (s Service) ValidatePlan(ctx context.Context, plan domain.CompilationPlan, 
 				return fmt.Errorf("%s field=%q value=%q reason=%q", pagePrefix, "target_page_id", action.TargetPageID, "page does not exist")
 			}
 		}
-		if action.Action == domain.ActionLink || action.Action == domain.ActionMerge {
+		if (action.Action == domain.ActionLink || action.Action == domain.ActionMerge) && !created[action.SourcePageID] {
 			if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM wiki_pages WHERE id = ? AND knowledge_base_id = ?`, action.SourcePageID, s.scope(ctx)).Scan(&count); err != nil {
 				return err
 			}
@@ -360,6 +409,11 @@ func (s Service) ApplyPlan(ctx context.Context, runID string, plan domain.Compil
 	if err := s.ValidatePlan(ctx, plan, plan.DocumentID); err != nil {
 		return Diff{}, err
 	}
+	created := planCreatedSlugs(plan)
+	// Apply CREATE actions first so LINK and MERGE actions that reference a
+	// page born in the same plan find an existing row (wiki_links enforces
+	// foreign keys against wiki_pages).
+	ordered := createsFirst(plan.PageActions)
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return Diff{}, err
@@ -367,7 +421,7 @@ func (s Service) ApplyPlan(ctx context.Context, runID string, plan domain.Compil
 	defer tx.Rollback()
 	diff := Diff{}
 	processed := 0
-	for _, action := range plan.PageActions {
+	for _, action := range ordered {
 		if action.Action == domain.ActionNoOp {
 			continue
 		}
@@ -375,7 +429,8 @@ func (s Service) ApplyPlan(ctx context.Context, runID string, plan domain.Compil
 			return Diff{}, fmt.Errorf("apply failure injected at action %d", processed)
 		}
 		processed++
-		pageID := action.TargetPageID
+		pageID := s.resolvePageRef(ctx, action.TargetPageID, created)
+		sourceID := s.resolvePageRef(ctx, action.SourcePageID, created)
 		page, err := loadPageTx(ctx, tx, pageID, s.scope(ctx))
 		if action.Action == domain.ActionCreate {
 			pageID = newID("page", s.scope(ctx)+":"+action.Slug)
@@ -464,7 +519,7 @@ func (s Service) ApplyPlan(ctx context.Context, runID string, plan domain.Compil
 			changed = true
 		}
 		if action.Action == domain.ActionLink {
-			result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO wiki_links (source_page_id, target_page_id, relation, created_by_run_id, knowledge_base_id) VALUES (?, ?, ?, ?, ?)`, action.SourcePageID, pageID, action.Relation, runID, s.scope(ctx))
+			result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO wiki_links (source_page_id, target_page_id, relation, created_by_run_id, knowledge_base_id) VALUES (?, ?, ?, ?, ?)`, sourceID, pageID, action.Relation, runID, s.scope(ctx))
 			if err != nil {
 				return Diff{}, err
 			}
@@ -474,11 +529,11 @@ func (s Service) ApplyPlan(ctx context.Context, runID string, plan domain.Compil
 			}
 		}
 		if action.Action == domain.ActionMerge {
-			sourcePage, sourceErr := loadPageTx(ctx, tx, action.SourcePageID, s.scope(ctx))
+			sourcePage, sourceErr := loadPageTx(ctx, tx, sourceID, s.scope(ctx))
 			if sourceErr != nil {
 				return Diff{}, sourceErr
 			}
-			if _, err = tx.ExecContext(ctx, `UPDATE wiki_claims SET page_id = ?, section_id = NULL, updated_by_run_id = ? WHERE page_id = ? AND knowledge_base_id = ?`, pageID, runID, action.SourcePageID, s.scope(ctx)); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE wiki_claims SET page_id = ?, section_id = NULL, updated_by_run_id = ? WHERE page_id = ? AND knowledge_base_id = ?`, pageID, runID, sourceID, s.scope(ctx)); err != nil {
 				return Diff{}, err
 			}
 			if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO wiki_links (source_page_id, target_page_id, relation, created_by_run_id, knowledge_base_id)
@@ -488,21 +543,21 @@ func (s Service) ApplyPlan(ctx context.Context, runID string, plan domain.Compil
 				FROM wiki_links
 				WHERE knowledge_base_id = ? AND (source_page_id = ? OR target_page_id = ?)
 				  AND CASE WHEN source_page_id = ? THEN ? ELSE source_page_id END != CASE WHEN target_page_id = ? THEN ? ELSE target_page_id END`,
-				action.SourcePageID, pageID, action.SourcePageID, pageID, runID,
-				s.scope(ctx), action.SourcePageID, action.SourcePageID,
-				action.SourcePageID, pageID, action.SourcePageID, pageID); err != nil {
+				sourceID, pageID, sourceID, pageID, runID,
+				s.scope(ctx), sourceID, sourceID,
+				sourceID, pageID, sourceID, pageID); err != nil {
 				return Diff{}, err
 			}
-			if _, err = tx.ExecContext(ctx, `DELETE FROM wiki_links WHERE knowledge_base_id = ? AND (source_page_id = ? OR target_page_id = ?)`, s.scope(ctx), action.SourcePageID, action.SourcePageID); err != nil {
+			if _, err = tx.ExecContext(ctx, `DELETE FROM wiki_links WHERE knowledge_base_id = ? AND (source_page_id = ? OR target_page_id = ?)`, s.scope(ctx), sourceID, sourceID); err != nil {
 				return Diff{}, err
 			}
 			sourcePage.Status = domain.PageStatusMerged
 			sourcePage.CurrentRevision++
 			sourcePage.UpdatedAt = time.Now().UTC()
-			if _, err = tx.ExecContext(ctx, `UPDATE wiki_pages SET status = ?, current_revision = ?, updated_at = ? WHERE id = ? AND knowledge_base_id = ?`, sourcePage.Status, sourcePage.CurrentRevision, sourcePage.UpdatedAt.Format(time.RFC3339Nano), action.SourcePageID, s.scope(ctx)); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE wiki_pages SET status = ?, current_revision = ?, updated_at = ? WHERE id = ? AND knowledge_base_id = ?`, sourcePage.Status, sourcePage.CurrentRevision, sourcePage.UpdatedAt.Format(time.RFC3339Nano), sourceID, s.scope(ctx)); err != nil {
 				return Diff{}, err
 			}
-			if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO wiki_links (source_page_id, target_page_id, relation, created_by_run_id, knowledge_base_id) VALUES (?, ?, 'merged_into', ?, ?)`, action.SourcePageID, pageID, runID, s.scope(ctx)); err != nil {
+			if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO wiki_links (source_page_id, target_page_id, relation, created_by_run_id, knowledge_base_id) VALUES (?, ?, 'merged_into', ?, ?)`, sourceID, pageID, runID, s.scope(ctx)); err != nil {
 				return Diff{}, err
 			}
 			diff.LinksAdded++
@@ -861,6 +916,322 @@ func (s Service) renderDefaultProjection(ctx context.Context) error {
 	return nil
 }
 
+type relatePage struct {
+	ID       string `json:"id"`
+	Slug     string `json:"slug"`
+	Title    string `json:"title"`
+	PageType string `json:"page_type"`
+	Summary  string `json:"summary"`
+}
+
+// RelateAll asks the model to relate every active Wiki page to the others and
+// stores confirmed relations as wiki_links attributed to runID, then re-renders
+// the projection. It is best-effort: it never alters compiled claims, so callers
+// (the compile pipeline, the relink endpoint) may log a failure and continue.
+// It returns the number of newly created links.
+func (s Service) RelateAll(ctx context.Context, runID string) (int, error) {
+	client := s.LLM
+	if client == nil {
+		return 0, errors.New("compiler LLM is not configured")
+	}
+	pages, claims, _, err := s.loadWikiState(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(pages) < 2 {
+		return 0, nil
+	}
+	claimsByPage := map[string][]string{}
+	for _, claim := range claims {
+		if claim.Status == "active" || claim.Status == "disputed" {
+			claimsByPage[claim.PageID] = append(claimsByPage[claim.PageID], claim.Text)
+		}
+	}
+	active := make(map[string]bool, len(pages))
+	catalog := make([]relatePage, 0, len(pages))
+	for _, page := range pages {
+		active[page.ID] = true
+		summary := page.Summary
+		if extra := claimsByPage[page.ID]; len(extra) > 0 {
+			summary += " " + strings.Join(extra, " ")
+		}
+		catalog = append(catalog, relatePage{ID: page.ID, Slug: page.Slug, Title: page.Title, PageType: string(page.PageType), Summary: summary})
+	}
+	pagesRaw, _ := json.Marshal(catalog)
+	raw, err := client.SuggestLinks(ctx, llm.LinkInput{Pages: pagesRaw, Catalog: json.RawMessage("[]")})
+	if err != nil {
+		return 0, err
+	}
+	suggestions, err := llm.DecodeStrict[domain.LinkSuggestions](raw)
+	if err != nil {
+		return 0, err
+	}
+	existing, err := s.loadWikiLinks(ctx)
+	if err != nil {
+		return 0, err
+	}
+	seen := make(map[string]bool, len(existing))
+	for _, link := range existing {
+		seen[link.SourcePageID+"\x00"+link.TargetPageID] = true
+	}
+	added := 0
+	for _, suggestion := range suggestions.Links {
+		if suggestion.SourcePageID == suggestion.TargetPageID || !active[suggestion.SourcePageID] || !active[suggestion.TargetPageID] || !validRelation(suggestion.Relation) {
+			continue
+		}
+		key := suggestion.SourcePageID + "\x00" + suggestion.TargetPageID
+		if seen[key] {
+			continue
+		}
+		result, err := s.DB.ExecContext(ctx, `INSERT OR IGNORE INTO wiki_links (source_page_id, target_page_id, relation, created_by_run_id, knowledge_base_id) VALUES (?, ?, ?, ?, ?)`, suggestion.SourcePageID, suggestion.TargetPageID, suggestion.Relation, runID, s.scope(ctx))
+		if err != nil {
+			return added, err
+		}
+		seen[key] = true
+		if n, _ := result.RowsAffected(); n > 0 {
+			added++
+		}
+	}
+	if added > 0 {
+		if err := s.renderDefaultProjection(ctx); err != nil {
+			return added, err
+		}
+	}
+	return added, nil
+}
+
+// Relink rebuilds the cross-page link graph over all active pages on demand,
+// attributing new links to the most recent compilation run. It backfills the
+// graph without recompiling each document.
+func (s Service) Relink(ctx context.Context) (int, error) {
+	var runID string
+	err := s.DB.QueryRowContext(ctx, `SELECT id FROM compilation_runs WHERE knowledge_base_id = ? ORDER BY created_at DESC LIMIT 1`, s.scope(ctx)).Scan(&runID)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return s.RelateAll(ctx, runID)
+}
+
+// DeleteSummary reports what a source deletion removed.
+type DeleteSummary struct {
+	DeletedPages  int `json:"deleted_pages"`
+	DeletedClaims int `json:"deleted_claims"`
+}
+
+func inClause(ids []string) (string, []any) {
+	if len(ids) == 0 {
+		// A non-empty sentinel that no real id equals: "x IN ('')" matches nothing
+		// and "x NOT IN ('')" is true for every real id (unlike NULL, which is unknown).
+		return "('')", nil
+	}
+	marks := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		marks[i] = "?"
+		args[i] = id
+	}
+	return "(" + strings.Join(marks, ",") + ")", args
+}
+
+func scanIDsTx(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// PLACEHOLDER_DELETE_METHODS
+
+// DeleteSource removes a source and every page derived exclusively from it,
+// preserving pages that other sources still support. It deletes the source's
+// original and parsed files, rebuilds the Wiki projection, reindexes, and
+// rebuilds cross-page links. Returns sql.ErrNoRows if the source is unknown.
+func (s Service) DeleteSource(ctx context.Context, documentID string) (DeleteSummary, error) {
+	scope := s.scope(ctx)
+	var originalPath, parsedPath string
+	if err := s.DB.QueryRowContext(ctx, `SELECT original_path, COALESCE(parsed_path, '') FROM source_documents WHERE id = ? AND knowledge_base_id = ?`, documentID, scope).Scan(&originalPath, &parsedPath); err != nil {
+		return DeleteSummary{}, err
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return DeleteSummary{}, err
+	}
+	defer tx.Rollback()
+
+	chunks, err := scanIDsTx(ctx, tx, `SELECT id FROM source_chunks WHERE document_id = ? AND knowledge_base_id = ?`, documentID, scope)
+	if err != nil {
+		return DeleteSummary{}, err
+	}
+	runs, err := scanIDsTx(ctx, tx, `SELECT id FROM compilation_runs WHERE document_id = ? AND knowledge_base_id = ?`, documentID, scope)
+	if err != nil {
+		return DeleteSummary{}, err
+	}
+	chunkIn, chunkArgs := inClause(chunks)
+	citing, err := scanIDsTx(ctx, tx, `SELECT DISTINCT claim_id FROM claim_evidence WHERE knowledge_base_id = ? AND source_chunk_id IN `+chunkIn, append([]any{scope}, chunkArgs...)...)
+	if err != nil {
+		return DeleteSummary{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM claim_evidence WHERE knowledge_base_id = ? AND source_chunk_id IN `+chunkIn, append([]any{scope}, chunkArgs...)...); err != nil {
+		return DeleteSummary{}, err
+	}
+	citingIn, citingArgs := inClause(citing)
+	claimsToDelete, err := scanIDsTx(ctx, tx, `SELECT c.id FROM wiki_claims c LEFT JOIN claim_evidence ce ON ce.claim_id = c.id AND ce.knowledge_base_id = c.knowledge_base_id WHERE c.knowledge_base_id = ? AND c.id IN `+citingIn+` GROUP BY c.id HAVING COUNT(ce.source_chunk_id) = 0`, append([]any{scope}, citingArgs...)...)
+	if err != nil {
+		return DeleteSummary{}, err
+	}
+	// SENTINEL_DELETE_SOURCE_PART2
+	deleteSet := make(map[string]bool, len(claimsToDelete))
+	for _, id := range claimsToDelete {
+		deleteSet[id] = true
+	}
+	// pagesToDelete: pages touched by this source whose every claim is being deleted.
+	touchedPages, err := scanIDsTx(ctx, tx, `SELECT DISTINCT page_id FROM wiki_claims WHERE knowledge_base_id = ? AND id IN `+citingIn, append([]any{scope}, citingArgs...)...)
+	if err != nil {
+		return DeleteSummary{}, err
+	}
+	pagesToDelete := make([]string, 0, len(touchedPages))
+	for _, pageID := range touchedPages {
+		claimIDs, err := scanIDsTx(ctx, tx, `SELECT id FROM wiki_claims WHERE page_id = ? AND knowledge_base_id = ?`, pageID, scope)
+		if err != nil {
+			return DeleteSummary{}, err
+		}
+		survivor := false
+		for _, id := range claimIDs {
+			if !deleteSet[id] {
+				survivor = true
+				break
+			}
+		}
+		if !survivor && len(claimIDs) > 0 {
+			pagesToDelete = append(pagesToDelete, pageID)
+		}
+	}
+	runIn, runArgs := inClause(runs)
+	delIn, delArgs := inClause(claimsToDelete)
+	pageIn, pageArgs := inClause(pagesToDelete)
+	// Repoint surviving claims that this source's runs last touched, so deleting
+	// those runs does not violate the updated_by_run_id foreign key. Match by id
+	// sets (globally unique) rather than scope, since a row's stored
+	// knowledge_base_id may differ from the request scope.
+	if _, err := tx.ExecContext(ctx, `UPDATE wiki_claims SET updated_by_run_id = created_by_run_id WHERE updated_by_run_id IN `+runIn+` AND id NOT IN `+delIn, concatArgs(runArgs, delArgs)...); err != nil {
+		return DeleteSummary{}, err
+	}
+	steps := []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM claim_evidence WHERE claim_id IN ` + delIn, delArgs},
+		{`DELETE FROM wiki_links WHERE source_page_id IN ` + pageIn + ` OR target_page_id IN ` + pageIn + ` OR created_by_run_id IN ` + runIn, concatArgs(pageArgs, pageArgs, runArgs)},
+		{`DELETE FROM wiki_revisions WHERE page_id IN ` + pageIn + ` OR compilation_run_id IN ` + runIn, concatArgs(pageArgs, runArgs)},
+		{`DELETE FROM wiki_claims WHERE id IN ` + delIn, delArgs},
+		{`DELETE FROM wiki_sections WHERE page_id IN ` + pageIn, pageArgs},
+		{`DELETE FROM wiki_passages WHERE page_id IN ` + pageIn, pageArgs},
+		{`DELETE FROM wiki_fts WHERE page_id IN ` + pageIn, pageArgs},
+		{`DELETE FROM wiki_pages WHERE id IN ` + pageIn, pageArgs},
+		{`DELETE FROM source_chunk_embeddings WHERE source_chunk_id IN ` + chunkIn, chunkArgs},
+		{`DELETE FROM source_chunks WHERE document_id = ?`, []any{documentID}},
+		{`DELETE FROM compilation_runs WHERE id IN ` + runIn, runArgs},
+		{`DELETE FROM source_documents WHERE id = ?`, []any{documentID}},
+	}
+	for _, step := range steps {
+		if _, err := tx.ExecContext(ctx, step.query, step.args...); err != nil {
+			return DeleteSummary{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return DeleteSummary{}, err
+	}
+	if originalPath != "" {
+		_ = os.Remove(originalPath)
+	}
+	if parsedPath != "" {
+		_ = os.Remove(parsedPath)
+	}
+	summary := DeleteSummary{DeletedPages: len(pagesToDelete), DeletedClaims: len(claimsToDelete)}
+	if err := s.renderDefaultProjection(ctx); err != nil {
+		logging.Logger(ctx).Error("re-render after source delete failed", "document_id", documentID, "error", logging.SafeSummary(err))
+	}
+	if s.Index != nil {
+		if _, err := s.Index.Reindex(ctx); err != nil {
+			logging.Logger(ctx).Error("reindex after source delete failed", "document_id", documentID, "error", logging.SafeSummary(err))
+		}
+	}
+	if _, err := s.Relink(ctx); err != nil {
+		logging.Logger(ctx).Error("relink after source delete failed", "document_id", documentID, "error", logging.SafeSummary(err))
+	}
+	return summary, nil
+}
+
+func concatArgs(groups ...[]any) []any {
+	out := make([]any, 0)
+	for _, group := range groups {
+		out = append(out, group...)
+	}
+	return out
+}
+
+// DeletePage removes a single Wiki page (by slug or id) and everything anchored
+// to it — its claims, evidence, sections, revisions, and any link touching it —
+// then rebuilds the projection and index. The source and its chunks are kept.
+// Returns sql.ErrNoRows if the page is unknown.
+func (s Service) DeletePage(ctx context.Context, key string) error {
+	scope := s.scope(ctx)
+	var pageID string
+	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM wiki_pages WHERE (slug = ? OR id = ?) AND knowledge_base_id = ?`, key, key, scope).Scan(&pageID); err != nil {
+		return err
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	steps := []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM claim_evidence WHERE claim_id IN (SELECT id FROM wiki_claims WHERE page_id = ?)`, []any{pageID}},
+		{`DELETE FROM wiki_links WHERE source_page_id = ? OR target_page_id = ?`, []any{pageID, pageID}},
+		{`DELETE FROM wiki_revisions WHERE page_id = ?`, []any{pageID}},
+		{`DELETE FROM wiki_claims WHERE page_id = ?`, []any{pageID}},
+		{`DELETE FROM wiki_sections WHERE page_id = ?`, []any{pageID}},
+		{`DELETE FROM wiki_passages WHERE page_id = ?`, []any{pageID}},
+		{`DELETE FROM wiki_fts WHERE page_id = ?`, []any{pageID}},
+		{`DELETE FROM wiki_pages WHERE id = ?`, []any{pageID}},
+	}
+	for _, step := range steps {
+		if _, err := tx.ExecContext(ctx, step.query, step.args...); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if err := s.renderDefaultProjection(ctx); err != nil {
+		logging.Logger(ctx).Error("re-render after page delete failed", "page_id", pageID, "error", logging.SafeSummary(err))
+	}
+	if s.Index != nil {
+		if _, err := s.Index.Reindex(ctx); err != nil {
+			logging.Logger(ctx).Error("reindex after page delete failed", "page_id", pageID, "error", logging.SafeSummary(err))
+		}
+	}
+	return nil
+}
+
+
+
 func validRelation(value string) bool {
 	switch value {
 	case "related_to", "part_of", "depends_on", "contradicts", "supports", "references":
@@ -1017,6 +1388,50 @@ func RenderMarkdownWithLinks(dataRoot string, pages []domain.WikiPage, claims []
 	return os.Rename(staging, target)
 }
 
+// pluralType is the directory name for a page type's Markdown projection.
+// Naive "+s" would misspell entity as "entitys".
+func pluralType(pageType domain.PageType) string {
+	if pageType == domain.PageTypeEntity {
+		return "entities"
+	}
+	return string(pageType) + "s"
+}
+
+type pageRef struct{ slug, title string }
+
+// linkifyMarkdown rewrites mentions of connected page titles in prose into
+// Obsidian-style [[slug|title]] links, preferring the longest title at each
+// position so nested titles resolve to the most specific page.
+func linkifyMarkdown(text string, conns []pageRef) string {
+	if text == "" || len(conns) == 0 {
+		return text
+	}
+	ordered := append([]pageRef(nil), conns...)
+	sort.Slice(ordered, func(i, j int) bool { return len([]rune(ordered[i].title)) > len([]rune(ordered[j].title)) })
+	runes := []rune(text)
+	var b strings.Builder
+	for i := 0; i < len(runes); {
+		matched := false
+		for _, c := range ordered {
+			title := []rune(c.title)
+			if len(title) == 0 || i+len(title) > len(runes) {
+				continue
+			}
+			if string(runes[i:i+len(title)]) == c.title {
+				fmt.Fprintf(&b, "[[%s|%s]]", c.slug, c.title)
+				i += len(title)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			b.WriteRune(runes[i])
+			i++
+		}
+	}
+	return b.String()
+}
+
 func renderMarkdownFiles(outputDir string, pages []domain.WikiPage, claims []domain.WikiClaim, evidence []domain.ClaimEvidence, links []domain.WikiLink) error {
 	activePages := pages[:0]
 	for _, page := range pages {
@@ -1041,6 +1456,34 @@ func renderMarkdownFiles(outputDir string, pages []domain.WikiPage, claims []dom
 		}
 		linksBySource[link.SourcePageID] = append(linksBySource[link.SourcePageID], link)
 	}
+	// Connected pages per page (both directions) drive inline [[slug|title]] links
+	// woven into the prose, so a mention like "暖橙面包店" is a link in the body.
+	connectionsByPage := map[string][]pageRef{}
+	seenConn := map[string]map[string]bool{}
+	addConn := func(pageID, otherID string) {
+		other, ok := pageByID[otherID]
+		if !ok || otherID == pageID || other.Title == "" {
+			return
+		}
+		if seenConn[pageID] == nil {
+			seenConn[pageID] = map[string]bool{}
+		}
+		if seenConn[pageID][otherID] {
+			return
+		}
+		seenConn[pageID][otherID] = true
+		connectionsByPage[pageID] = append(connectionsByPage[pageID], pageRef{slug: other.Slug, title: other.Title})
+	}
+	for _, link := range links {
+		if _, ok := pageByID[link.SourcePageID]; !ok {
+			continue
+		}
+		if _, ok := pageByID[link.TargetPageID]; !ok {
+			continue
+		}
+		addConn(link.SourcePageID, link.TargetPageID)
+		addConn(link.TargetPageID, link.SourcePageID)
+	}
 	for _, claim := range claims {
 		claimByPage[claim.PageID] = append(claimByPage[claim.PageID], claim)
 	}
@@ -1049,7 +1492,7 @@ func renderMarkdownFiles(outputDir string, pages []domain.WikiPage, claims []dom
 	}
 	sort.Slice(pages, func(i, j int) bool { return pages[i].Slug < pages[j].Slug })
 	for _, pageType := range []domain.PageType{domain.PageTypeConcept, domain.PageTypeEntity, domain.PageTypeTopic} {
-		if err := os.MkdirAll(filepath.Join(outputDir, string(pageType)+"s"), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(outputDir, pluralType(pageType)), 0o755); err != nil {
 			return err
 		}
 	}
@@ -1060,7 +1503,7 @@ func renderMarkdownFiles(outputDir string, pages []domain.WikiPage, claims []dom
 		if !validRenderSlug(page.Slug) {
 			return fmt.Errorf("refuse to render wiki page with unsafe slug %q", page.Slug)
 		}
-		fmt.Fprintf(&index, "- [%s](%ss/%s.md)\n", page.Title, page.PageType, page.Slug)
+		fmt.Fprintf(&index, "- [%s](%s/%s.md)\n", page.Title, pluralType(page.PageType), page.Slug)
 	}
 	if err := os.WriteFile(filepath.Join(outputDir, "index.md"), []byte(index.String()), 0o644); err != nil {
 		return err
@@ -1070,14 +1513,15 @@ func renderMarkdownFiles(outputDir string, pages []domain.WikiPage, claims []dom
 			return fmt.Errorf("refuse to render wiki page with unsafe slug %q", page.Slug)
 		}
 		var b strings.Builder
-		fmt.Fprintf(&b, "---\nslug: %s\npage_type: %s\nstatus: %s\nrevision: %d\n---\n\n# %s\n\n%s\n\n## Claims\n", page.Slug, page.PageType, page.Status, page.CurrentRevision, page.Title, page.Summary)
+		conns := connectionsByPage[page.ID]
+		fmt.Fprintf(&b, "---\nslug: %s\npage_type: %s\nstatus: %s\nrevision: %d\n---\n\n# %s\n\n%s\n\n## Claims\n", page.Slug, page.PageType, page.Status, page.CurrentRevision, page.Title, linkifyMarkdown(page.Summary, conns))
 		items := claimByPage[page.ID]
 		sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 		for _, claim := range items {
 			if claim.Status != "active" && claim.Status != "disputed" {
 				continue
 			}
-			fmt.Fprintf(&b, "\n- **%s**: %s", claim.ClaimType, claim.Text)
+			fmt.Fprintf(&b, "\n- **%s**: %s", claim.ClaimType, linkifyMarkdown(claim.Text, conns))
 			citations := evidenceByClaim[claim.ID]
 			sort.Slice(citations, func(i, j int) bool { return citations[i].SourceChunkID < citations[j].SourceChunkID })
 			for _, citation := range citations {
@@ -1102,7 +1546,7 @@ func renderMarkdownFiles(outputDir string, pages []domain.WikiPage, claims []dom
 		content := []byte(b.String())
 		for _, path := range []string{
 			filepath.Join(outputDir, page.Slug+".md"),
-			filepath.Join(outputDir, string(page.PageType)+"s", page.Slug+".md"),
+			filepath.Join(outputDir, pluralType(page.PageType), page.Slug+".md"),
 		} {
 			if err := os.WriteFile(path, content, 0o644); err != nil {
 				return err

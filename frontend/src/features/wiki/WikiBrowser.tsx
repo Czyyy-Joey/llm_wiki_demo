@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { BookOpen, ChevronRight, FileText, GitBranch, History, Link2, PanelRightClose, PanelRightOpen } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { BookOpen, ChevronRight, FileText, GitBranch, History, Link2, PanelRightClose, PanelRightOpen, Trash2 } from 'lucide-react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { getWikiPage, getWikiPages, getWikiRevisions, type EvidenceView, type PageType } from '../../api/contracts'
+import { deleteWikiPage, getWikiPage, getWikiPages, getWikiRevisions, type EvidenceView, type PageType } from '../../api/contracts'
 import { useI18n } from '../../i18n'
 import { useWorkspace } from '../../workspace'
 
@@ -20,6 +20,26 @@ function locationLabel(evidence: EvidenceView, t: (key: string) => string) {
   return parts.join(' · ')
 }
 
+function linkedText(text: string, connections: { title: string; slug: string }[]): ReactNode {
+  if (!text || connections.length === 0) return text
+  const nodes: ReactNode[] = []
+  let buffer = ''
+  let key = 0
+  for (let i = 0; i < text.length; ) {
+    const match = connections.find(c => c.title && text.startsWith(c.title, i))
+    if (match) {
+      if (buffer) { nodes.push(buffer); buffer = '' }
+      nodes.push(<Link key={key++} className="wiki-link" to={`/wiki/${match.slug}`}>{match.title}</Link>)
+      i += match.title.length
+    } else {
+      buffer += text[i]
+      i++
+    }
+  }
+  if (buffer) nodes.push(buffer)
+  return nodes
+}
+
 export function WikiBrowser() {
   const { slug } = useParams()
   const navigate = useNavigate()
@@ -33,8 +53,19 @@ export function WikiBrowser() {
   const inspectorRef = useRef<HTMLElement | null>(null)
   const [inspectorOpen, setInspectorOpen] = useState(() => !window.matchMedia('(max-width: 760px)').matches)
   const [view, setView] = useState<'knowledge' | 'revisions'>('knowledge')
+  const previousWorkspace = useRef(workspace.selectedID)
+  const queryClient = useQueryClient()
+  const removePage = useMutation({
+    mutationFn: deleteWikiPage,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['wiki-pages'] })
+      navigate('/wiki', { replace: true })
+    },
+  })
 
   useEffect(() => {
+    if (previousWorkspace.current === workspace.selectedID) return
+    previousWorkspace.current = workspace.selectedID
     navigate('/wiki', { replace: true })
   }, [navigate, workspace.selectedID])
 
@@ -57,6 +88,13 @@ export function WikiBrowser() {
   }, [inspectorOpen, selectedEvidence])
 
   const grouped = useMemo(() => types.map(type => ({ ...type, pages: pages.data?.filter(page => page.page_type === type.value) ?? [] })), [pages.data])
+  const connections = useMemo(() => {
+    const byTitle = new Map<string, string>()
+    for (const item of [...(detail.data?.links ?? []), ...(detail.data?.backlinks ?? [])]) {
+      if (item.page.title) byTitle.set(item.page.title, item.page.slug)
+    }
+    return [...byTitle.entries()].map(([title, slug]) => ({ title, slug })).sort((a, b) => b.title.length - a.title.length)
+  }, [detail.data])
 
   return <div className={`wiki-workspace ${inspectorOpen ? '' : 'inspector-collapsed'}`}>
     <aside className="wiki-tree" aria-label="Wiki pages">
@@ -83,7 +121,10 @@ export function WikiBrowser() {
       {detail.data && detail.data.page.status === 'active' && <>
         <header className="reader-header">
           <div><span className={`type-mark ${detail.data.page.page_type}`}>{detail.data.page.page_type}</span><h1>{detail.data.page.title}</h1></div>
-          <button className="icon-button" title={t(inspectorOpen ? 'Close citation inspector' : 'Open citation inspector')} onClick={() => setInspectorOpen(value => !value)}>{inspectorOpen ? <PanelRightClose size={19} /> : <PanelRightOpen size={19} />}</button>
+          <div className="reader-actions">
+            <button className="icon-button danger" title={t('Delete page')} disabled={removePage.isPending} onClick={() => { if (slug && window.confirm(t('Delete this page and its links? This cannot be undone.'))) removePage.mutate(slug) }}><Trash2 size={18} /></button>
+            <button className="icon-button" title={t(inspectorOpen ? 'Close citation inspector' : 'Open citation inspector')} onClick={() => setInspectorOpen(value => !value)}>{inspectorOpen ? <PanelRightClose size={19} /> : <PanelRightOpen size={19} />}</button>
+          </div>
         </header>
         <div className="reader-meta"><span>{t('Revision')} {detail.data.page.current_revision}</span><span>{detail.data.claims.length} {t('claims')}</span><span>{detail.data.sources.length} {t('sources')}</span></div>
         <nav className="view-tabs" aria-label="Page views">
@@ -91,12 +132,12 @@ export function WikiBrowser() {
           <button className={view === 'revisions' ? 'active' : ''} onClick={() => setView('revisions')}><History size={15} />{t('Revisions')}</button>
         </nav>
         {view === 'knowledge' ? <>
-          <p className="page-summary">{detail.data.page.summary}</p>
+          <p className="page-summary">{linkedText(detail.data.page.summary, connections)}</p>
           {detail.data.sections.map(section => <section className="knowledge-section" key={section.section.id}>
             <h2>{section.section.heading}</h2>
             {section.claims.filter(item => item.claim.status !== 'superseded').map(item => <article className={`claim ${item.claim.status}`} key={item.claim.id}>
               <div className="claim-heading"><span>{item.claim.claim_type}</span>{item.claim.status === 'disputed' && <strong>{t('Disputed')}</strong>}</div>
-              <p>{item.claim.text}</p>
+              <p>{linkedText(item.claim.text, connections)}</p>
               <div className="citations">{item.evidence.map((evidence, index) => <button key={`${evidence.chunk.id}-${evidence.evidence.relation}`} onClick={() => { setSelectedEvidence(evidence); setInspectorOpen(true) }}>
                 [{index + 1}] {evidence.source.original_name}<ChevronRight size={13} />
               </button>)}</div>

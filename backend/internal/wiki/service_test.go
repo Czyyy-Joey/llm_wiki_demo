@@ -120,6 +120,59 @@ func TestWikiServiceBrowsesProvenanceLinksRevisionsAndLint(t *testing.T) {
 	}
 }
 
+func TestWikiServiceGraphReturnsActiveNodesAndEdges(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := appdb.Open(ctx, "file:"+filepath.Join(root, "app.db")+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	if _, err := database.Exec(`PRAGMA foreign_keys = OFF`); err != nil {
+		t.Fatal(err)
+	}
+	pages := []struct{ id, slug, status string }{
+		{"g-a", "graph-a", "active"},
+		{"g-b", "graph-b", "active"},
+		{"g-merged", "graph-merged", "merged"},
+	}
+	for _, page := range pages {
+		if _, err := database.Exec(`INSERT INTO wiki_pages (id, slug, page_type, title, summary, status, current_revision, created_at, updated_at) VALUES (?, ?, 'concept', ?, 'Summary', ?, 1, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')`, page.id, page.slug, page.slug, page.status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := database.Exec(`INSERT INTO compilation_runs (id, document_id, status, created_at) VALUES ('run-graph', 'doc-graph', 'succeeded', '2024-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	edgeRows := [][3]string{
+		{"g-a", "g-b", "related_to"},    // kept: both active
+		{"g-a", "g-merged", "related_to"}, // dropped: target inactive
+		{"g-merged", "g-a", "merged_into"}, // dropped: merged_into relation
+	}
+	for _, edge := range edgeRows {
+		if _, err := database.Exec(`INSERT INTO wiki_links (source_page_id, target_page_id, relation, created_by_run_id) VALUES (?, ?, ?, 'run-graph')`, edge[0], edge[1], edge[2]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	graph, err := Service{DB: database}.Graph(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(graph.Nodes) != 2 {
+		t.Fatalf("nodes = %#v", graph.Nodes)
+	}
+	for _, node := range graph.Nodes {
+		if node.Slug == "graph-merged" {
+			t.Fatalf("graph exposed a non-active page: %#v", node)
+		}
+	}
+	if len(graph.Edges) != 1 || graph.Edges[0].Source != "g-a" || graph.Edges[0].Target != "g-b" || graph.Edges[0].Relation != "related_to" {
+		t.Fatalf("edges = %#v", graph.Edges)
+	}
+}
+
 func TestMarkdownProjectionIncludesDeterministicIndexAndTypedPage(t *testing.T) {
 	root := t.TempDir()
 	page := domain.WikiPage{ID: "page-1", Slug: "compiled-topic", PageType: domain.PageTypeTopic, Title: "Compiled Topic", Summary: "Summary", Status: domain.PageStatusActive, CurrentRevision: 1}

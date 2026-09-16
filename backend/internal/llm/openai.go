@@ -119,6 +119,16 @@ func (c *OpenAICompatible) Plan(ctx context.Context, input PlanInput) (json.RawM
 	return c.complete(ctx, prompt, fmt.Sprintf("Document ID: %s\n\nAnalysis:\n%s\n\nCandidates:\n%s", input.DocumentID, input.Analysis, input.Candidates), "compilation_plan", schema)
 }
 
+func (c *OpenAICompatible) SuggestLinks(ctx context.Context, input LinkInput) (json.RawMessage, error) {
+	schema, _ := json.Marshal(SchemaFor[domain.LinkSuggestions]())
+	prompt := LanguageInstruction(ctx) + "\n\n" + c.prompt("relate.txt", defaultRelatePrompt)
+	catalog := input.Catalog
+	if len(catalog) == 0 {
+		catalog = json.RawMessage("[]")
+	}
+	return c.complete(ctx, prompt, fmt.Sprintf("Pages to relate:\n%s\n\nOther existing pages:\n%s", input.Pages, catalog), "link_suggestions", schema)
+}
+
 func (c *OpenAICompatible) Rewrite(ctx context.Context, question string, history []ChatTurn) (json.RawMessage, error) {
 	schema, _ := json.Marshal(SchemaFor[domain.StandaloneQuery]())
 	historyJSON, _ := json.Marshal(history)
@@ -173,13 +183,17 @@ func (c *OpenAICompatible) complete(ctx context.Context, system, user, name stri
 	if c == nil || c.Endpoint == "" || c.APIKey == "" || c.Model == "" {
 		return nil, fmt.Errorf("LLM provider is not configured")
 	}
+	// Some OpenAI-compatible proxies (Baidu OneAPI among them) accept a
+	// response_format json_schema but do not enforce it, so the model invents
+	// field names or enum values. Embed the schema in the prompt as well so the
+	// exact contract is always visible regardless of proxy behavior.
+	system += "\n\nReturn one JSON object that strictly matches this JSON Schema. Use exactly these field names and enum values, and output no markdown or code fences:\n" + string(schema)
 	request := chatRequest{Model: c.Model, Messages: []chatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}}, ResponseFormat: responseFormat{Type: "json_schema", JSONSchema: &responseSchema{Name: name, Strict: true, Schema: schema}}}
 	status, data, err := c.sendChat(ctx, request)
 	if err != nil {
 		return nil, err
 	}
 	if (status == http.StatusBadRequest || status == http.StatusUnprocessableEntity) && structuredOutputUnsupported(data) {
-		request.Messages[0].Content += "\n\nReturn one JSON object that strictly matches this JSON Schema:\n" + string(schema)
 		request.ResponseFormat = responseFormat{Type: "json_object"}
 		status, data, err = c.sendChat(ctx, request)
 		if err != nil {
@@ -196,10 +210,29 @@ func (c *OpenAICompatible) complete(ctx context.Context, system, user, name stri
 	if result.Error != nil {
 		return nil, fmt.Errorf("LLM error: %s", result.Error.Message)
 	}
-	if len(result.Choices) == 0 || strings.TrimSpace(result.Choices[0].Message.Content) == "" {
+	if len(result.Choices) == 0 {
 		return nil, fmt.Errorf("LLM returned no structured content")
 	}
-	return json.RawMessage(result.Choices[0].Message.Content), nil
+	content := stripJSONFence(result.Choices[0].Message.Content)
+	if content == "" {
+		return nil, fmt.Errorf("LLM returned no structured content")
+	}
+	return json.RawMessage(content), nil
+}
+
+// stripJSONFence removes a surrounding markdown code fence. OneAPI proxies do
+// not guarantee strict json_schema enforcement, so a model may return valid
+// JSON wrapped in ```json ... ```, which DecodeStrict cannot parse.
+func stripJSONFence(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if !strings.HasPrefix(trimmed, "```") {
+		return trimmed
+	}
+	trimmed = strings.TrimPrefix(trimmed, "```")
+	if idx := strings.IndexByte(trimmed, '\n'); idx >= 0 {
+		trimmed = trimmed[idx+1:]
+	}
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(trimmed), "```"))
 }
 
 func (c *OpenAICompatible) sendChat(ctx context.Context, request chatRequest) (int, []byte, error) {
@@ -243,7 +276,8 @@ func structuredOutputUnsupported(data []byte) bool {
 	return strings.Contains(message, "response_format") || strings.Contains(message, "json_schema") || strings.Contains(message, "structured output")
 }
 
-const defaultAnalyzePrompt = `Analyze the supplied source document into a concise structured knowledge analysis. Group chunks under distinct top-level concepts, entities, or topics. For every topic, page_type MUST be exactly one of "concept", "entity", or "topic". A schedule, plan, checklist, timeline, or task list is still a "topic" unless it is clearly an entity or concept; never output "plan" as page_type. Every claim_type MUST be exactly one of "fact", "definition", "argument", "procedure", or "caveat". Every relation MUST be exactly one of "related_to", "part_of", "depends_on", "contradicts", "supports", or "references". Every claim must cite one or more supplied source chunk IDs. Do not invent evidence IDs. Return JSON only.`
-const defaultPlanPrompt = `Create a compilation plan from the analysis and candidates. Prefer UPDATE for a semantically matching existing page. Use only candidate page IDs for UPDATE, LINK, or MERGE. Every ADD, REVISE, SUPERSEDE, or MARK_DISPUTED claim must cite supplied source chunk IDs. Return JSON only.`
+const defaultAnalyzePrompt = `Analyze the supplied source document into a concise structured knowledge analysis. Extract the distinct subjects the source is about; prefer fine-grained subjects over broad umbrellas. Any named person, place, organization, product, device, or animal the source states facts about MUST be its own entry, even when it also appears inside a plan or task. page_type MUST be exactly one of: "entity" (a specific named real-world thing — person, place/address, organization, product, device, animal, or account); "concept" (an abstract idea, term, category, method, or definition, independent of any single instance); or "topic" (an event, plan, process, schedule, checklist, task set, or arrangement tying subjects together over time). A schedule, plan, checklist, timeline, or task list is a "topic"; never output "plan" as page_type. When a topic references specific people, places, organizations, or products, create separate entity entries for them and connect with relations rather than folding them into the topic. Every claim_type MUST be exactly one of "fact", "definition", "argument", "procedure", or "caveat". Every relation MUST be exactly one of "related_to", "part_of", "depends_on", "contradicts", "supports", or "references". Every claim must cite one or more supplied source chunk IDs. Do not invent evidence IDs. Return JSON only.`
+const defaultPlanPrompt = `Create a compilation plan from the analysis and candidates. Prefer UPDATE for a semantically matching existing page. Set page-reference fields per action: UPDATE sets only target_page_id to the existing candidate page ID and never sets source_page_id; LINK sets source_page_id, target_page_id, and relation; MERGE sets source_page_id to the duplicate page to fold away and target_page_id to the page to keep. In UPDATE, LINK, or MERGE, reference an existing page by its candidate page ID, or reference a page you CREATE in this same plan by its slug. Every ADD, REVISE, SUPERSEDE, or MARK_DISPUTED claim must cite supplied source chunk IDs. Return JSON only.`
+const defaultRelatePrompt = `Relate compiled Wiki pages into a knowledge graph. You are given pages to relate and a catalog of other existing pages, each with an id, title, and summary. Propose directed relations that are clearly supported by the page titles and summaries. source_page_id and target_page_id MUST be ids drawn from the supplied pages or catalog; never invent ids and never relate a page to itself. relation MUST be exactly one of "related_to", "part_of", "depends_on", "contradicts", "supports", or "references". Prefer the most specific relation, and omit weak or speculative links. Return JSON only.`
 const defaultRewritePrompt = `Rewrite the follow-up into one concise standalone retrieval query using only the recent history supplied. Preserve the user's intent. Return JSON only.`
 const defaultAnswerPrompt = `Answer only from the allowed context. Use Wiki context as the primary knowledge representation, but citation_ids must contain only exact source_evidence or source_fallback context IDs supplied in the prompt. If source evidence is insufficient, answer exactly "知识库证据不足，无法基于现有证据回答。" with an empty citation_ids array. Return JSON only.`

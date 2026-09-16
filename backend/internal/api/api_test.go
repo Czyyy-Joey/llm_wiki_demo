@@ -198,6 +198,59 @@ func TestCompilationAPIExposesIntermediateResults(t *testing.T) {
 	}
 }
 
+func TestRelinkEndpointCreatesCrossPageLinks(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := db.Open(ctx, "file:"+filepath.Join(root, "app.db")+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := &Server{
+		DB:       database,
+		Config:   config.Load(),
+		Sources:  sources.Service{DB: database, DataRoot: root},
+		Compiler: compiler.Service{DB: database, DataRoot: root, LLM: llm.DeterministicFake{}},
+		Wiki:     wiki.Service{DB: database},
+	}
+	source, err := server.Sources.Ingest(ctx, sources.IngestInput{OriginalName: "relink.txt", MediaType: "text/plain", Data: []byte("evidence for relink")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO compilation_runs (id, document_id, status, created_at) VALUES ('run_relink', ?, 'applied', '2024-01-01T00:00:00Z')`, source.Document.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, page := range []struct{ id, slug, title, summary string }{
+		{"page_lin", "lin-ran", "林然", "林然计划搬到云栖花园 8 栋 1203。"},
+		{"page_home", "yunqi-garden-building-8-1203", "云栖花园 8 栋 1203", "林然的新家。"},
+	} {
+		if _, err = database.Exec(`INSERT INTO wiki_pages (id, slug, page_type, title, summary, status, current_revision, created_at, updated_at) VALUES (?, ?, 'entity', ?, ?, 'active', 0, ?, ?)`, page.id, page.slug, page.title, page.summary, "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	response := httptest.NewRecorder()
+	server.Router().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/compilations/relink", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("relink status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var result struct {
+		LinksAdded int `json:"links_added"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.LinksAdded < 1 {
+		t.Fatalf("links_added = %d, want >= 1", result.LinksAdded)
+	}
+	var count int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM wiki_links WHERE source_page_id = 'page_lin' AND target_page_id = 'page_home'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("cross-page link count = %d, want 1", count)
+	}
+}
+
 func TestWikiAPIExposesBrowsingAndProvenanceContracts(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -340,5 +393,71 @@ func TestRetrievalAPIReindexSearchAndTrace(t *testing.T) {
 	var trace domain.RetrievalTrace
 	if err := json.Unmarshal(response.Body.Bytes(), &trace); err != nil || trace.ID != result.Trace.ID || len(trace.Candidates) == 0 {
 		t.Fatalf("trace response = %#v, err = %v", trace, err)
+	}
+}
+
+func TestDeleteSourceAndPageEndpoints(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := db.Open(ctx, "file:"+filepath.Join(root, "app.db")+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	server := &Server{
+		DB:       database,
+		Config:   config.Load(),
+		Sources:  sources.Service{DB: database, DataRoot: root},
+		Compiler: compiler.Service{DB: database, DataRoot: root, LLM: llm.DeterministicFake{}},
+		Wiki:     wiki.Service{DB: database},
+	}
+	source, err := server.Sources.Ingest(ctx, sources.IngestInput{OriginalName: "del.md", MediaType: "text/markdown", Data: []byte("# Alpha\n\nAlpha is a claim.\n\n# Beta\n\nBeta is a claim.")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Compiler.Compile(ctx, source.Document.ID); err != nil {
+		t.Fatal(err)
+	}
+	var before int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM wiki_pages WHERE status='active'`).Scan(&before); err != nil || before == 0 {
+		t.Fatalf("expected compiled pages, got %d (err %v)", before, err)
+	}
+	// Delete one page.
+	var slug string
+	if err := database.QueryRow(`SELECT slug FROM wiki_pages WHERE status='active' ORDER BY slug LIMIT 1`).Scan(&slug); err != nil {
+		t.Fatal(err)
+	}
+	resp := httptest.NewRecorder()
+	server.Router().ServeHTTP(resp, httptest.NewRequest(http.MethodDelete, "/api/wiki/pages/"+slug, nil))
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("delete page status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	// 404 for unknown page.
+	resp = httptest.NewRecorder()
+	server.Router().ServeHTTP(resp, httptest.NewRequest(http.MethodDelete, "/api/wiki/pages/does-not-exist", nil))
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("delete unknown page status = %d", resp.Code)
+	}
+	// Delete the source: remaining derived pages disappear.
+	resp = httptest.NewRecorder()
+	server.Router().ServeHTTP(resp, httptest.NewRequest(http.MethodDelete, "/api/sources/"+source.Document.ID, nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("delete source status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	var after, srcs int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM wiki_pages WHERE status='active'`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != 0 {
+		t.Fatalf("expected all derived pages removed, got %d", after)
+	}
+	if err := database.QueryRow(`SELECT COUNT(*) FROM source_documents`).Scan(&srcs); err != nil || srcs != 0 {
+		t.Fatalf("source row not deleted: %d (err %v)", srcs, err)
+	}
+	// 404 for unknown source.
+	resp = httptest.NewRecorder()
+	server.Router().ServeHTTP(resp, httptest.NewRequest(http.MethodDelete, "/api/sources/src_missing", nil))
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("delete unknown source status = %d", resp.Code)
 	}
 }

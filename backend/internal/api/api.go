@@ -120,14 +120,18 @@ func (s *Server) Router() http.Handler {
 	r.Get("/api/sources", s.listSources)
 	r.Get("/api/source-chunks/{id}", s.getSourceChunk)
 	r.Get("/api/sources/{id}", s.getSource)
+	r.Delete("/api/sources/{id}", s.deleteSource)
 	r.Get("/api/sources/{id}/chunks", s.getSourceChunks)
 	r.Get("/api/sources/{id}/wiki", s.getSourceWiki)
+	r.Get("/api/wiki/graph", s.getWikiGraph)
 	r.Get("/api/wiki/pages", s.listWikiPages)
 	r.Get("/api/wiki/pages/{key}", s.getWikiPage)
+	r.Delete("/api/wiki/pages/{key}", s.deleteWikiPage)
 	r.Get("/api/wiki/pages/{key}/revisions", s.getWikiRevisions)
 	r.Get("/api/wiki/pages/{key}/revisions/{revision}", s.getWikiRevisionDiff)
 	r.Get("/api/wiki/lint", s.lintWiki)
 	r.Post("/api/compilations", s.createCompilation)
+	r.Post("/api/compilations/relink", s.relinkWiki)
 	r.Get("/api/compilations", s.listCompilations)
 	r.Get("/api/compilations/{id}", s.getCompilation)
 	r.Post("/api/compilations/{id}/render", s.retryCompilationRender)
@@ -344,6 +348,43 @@ func (s *Server) createCompilation(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, result)
 }
 
+func (s *Server) deleteSource(w http.ResponseWriter, r *http.Request) {
+	runtime, _ := runtimeFromContext(r.Context())
+	summary, err := runtime.Compiler.DeleteSource(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusNotFound, fmt.Errorf("source not found"))
+			return
+		}
+		writeJSONError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, summary)
+}
+
+func (s *Server) deleteWikiPage(w http.ResponseWriter, r *http.Request) {
+	runtime, _ := runtimeFromContext(r.Context())
+	if err := runtime.Compiler.DeletePage(r.Context(), chi.URLParam(r, "key")); err != nil {
+		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusNotFound, fmt.Errorf("wiki page not found"))
+			return
+		}
+		writeJSONError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) relinkWiki(w http.ResponseWriter, r *http.Request) {
+	runtime, _ := runtimeFromContext(r.Context())
+	added, err := runtime.Compiler.Relink(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"links_added": added})
+}
+
 func (s *Server) listCompilations(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	runtime, _ := runtimeFromContext(r.Context())
@@ -476,6 +517,15 @@ func (s *Server) getSourceWiki(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+func (s *Server) getWikiGraph(w http.ResponseWriter, r *http.Request) {
+	runtime, _ := runtimeFromContext(r.Context())
+	graph, err := runtime.Wiki.Graph(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, graph)
 }
 func (s *Server) listWikiPages(w http.ResponseWriter, r *http.Request) {
 	runtime, _ := runtimeFromContext(r.Context())

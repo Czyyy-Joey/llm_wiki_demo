@@ -14,6 +14,36 @@ import (
 	"github.com/joeychen/llm-wiki-demo/backend/internal/domain"
 )
 
+func TestDeterministicFakeSuggestLinksFromMentions(t *testing.T) {
+	client := DeterministicFake{}
+	pages := []map[string]string{
+		{"id": "page_zhou", "title": "周宁", "summary": "周宁是暖橙面包店的店主。"},
+		{"id": "page_bakery", "title": "暖橙面包店", "summary": "暖橙面包店位于青禾社区。"},
+		{"id": "page_other", "title": "杭州短途旅行", "summary": "与前两者无关。"},
+	}
+	pagesRaw, _ := json.Marshal(pages)
+	raw, err := client.SuggestLinks(context.Background(), LinkInput{Pages: pagesRaw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	suggestions, err := DecodeStrict[domain.LinkSuggestions](raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, link := range suggestions.Links {
+		if link.SourcePageID == "page_zhou" && link.TargetPageID == "page_bakery" && link.Relation == "references" {
+			found = true
+		}
+		if link.SourcePageID == link.TargetPageID {
+			t.Fatalf("self link produced: %#v", link)
+		}
+	}
+	if !found {
+		t.Fatalf("expected page_zhou -> page_bakery reference, got %#v", suggestions.Links)
+	}
+}
+
 func TestDecodeStrict(t *testing.T) {
 	valid := `{"document_id":"doc_1","page_actions":[],"schema_version":"1"}`
 	plan, err := DecodeStrict[domain.CompilationPlan]([]byte(valid))

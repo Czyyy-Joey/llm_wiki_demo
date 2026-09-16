@@ -165,6 +165,18 @@ type AnalyzedClaim struct {
 	ClaimType        ClaimType `json:"claim_type"`
 	EvidenceChunkIDs []string  `json:"evidence_chunk_ids"`
 }
+
+// LinkSuggestion is one directed relation the relate stage proposes between two
+// existing Wiki pages, referenced by page ID.
+type LinkSuggestion struct {
+	SourcePageID string `json:"source_page_id"`
+	TargetPageID string `json:"target_page_id"`
+	Relation     string `json:"relation"`
+	Reason       string `json:"reason"`
+}
+type LinkSuggestions struct {
+	Links []LinkSuggestion `json:"links"`
+}
 type CompilationCandidate struct {
 	TopicKey   string   `json:"topic_key"`
 	PageID     string   `json:"page_id"`

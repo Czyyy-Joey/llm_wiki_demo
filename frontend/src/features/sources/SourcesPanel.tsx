@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertCircle, CheckCircle2, FileText, RefreshCw, Upload } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { compileSource, getSourceChunk, getSourceChunks, getSources, getSourceWiki, uploadSource, type SourceChunk } from '../../api/contracts'
+import { compileSource, deleteSource, getSourceChunk, getSourceChunks, getSources, getSourceWiki, uploadSource, type SourceChunk } from '../../api/contracts'
 import { useI18n } from '../../i18n'
 import { useWorkspace } from '../../workspace'
 
@@ -26,6 +26,16 @@ export function SourcesPanel() {
   const directChunk = useQuery({ queryKey: ['source-chunk', workspace.selectedID, selectedChunk], queryFn: () => getSourceChunk(selectedChunk), enabled: Boolean(selectedChunk) })
   const upload = useMutation({ mutationFn: uploadSource, onSuccess: value => { void client.invalidateQueries({ queryKey: ['sources', workspace.selectedID] }); setSelectedID(value.source.id); setParams({ source: value.source.id }) } })
   const compile = useMutation({ mutationFn: compileSource })
+  const remove = useMutation({
+    mutationFn: deleteSource,
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['sources', workspace.selectedID] })
+      void client.invalidateQueries({ queryKey: ['wiki-pages'] })
+      setSelectedID('')
+      setSelectedChunk('')
+      setParams({})
+    },
+  })
 
   useEffect(() => {
     setSelectedID('')
@@ -55,7 +65,8 @@ export function SourcesPanel() {
         {!sources.isLoading && sources.data?.length === 0 && <State text={t('Upload Markdown, TXT, or a text PDF to begin.')} retry={t('Retry')} />}
       </aside>
       <section className="record-detail">{source ? <>
-        <div className="detail-head"><div><Status value={source.status} /><h2>{source.original_name}</h2><p>{source.id}</p></div>{source.status === 'parsed' && <button className="primary-command" disabled={compile.isPending} onClick={() => compile.mutate(source.id)}>{t(compile.isPending ? 'Compiling...' : 'Compile Source')}</button>}</div>
+        <div className="detail-head"><div><Status value={source.status} /><h2>{source.original_name}</h2><p>{source.id}</p></div><div className="detail-actions">{source.status === 'parsed' && <button className="primary-command" disabled={compile.isPending} onClick={() => compile.mutate(source.id)}>{t(compile.isPending ? 'Compiling...' : 'Compile Source')}</button>}<button className="danger-command" disabled={remove.isPending} onClick={() => { if (window.confirm(t('Delete this source and every page compiled only from it? This cannot be undone.'))) remove.mutate(source.id) }}>{t(remove.isPending ? 'Deleting...' : 'Delete source')}</button></div></div>
+        {remove.isError && <div className="notice error"><AlertCircle size={16} /><span>{remove.error.message}</span><button onClick={() => remove.reset()}>{t('Dismiss')}</button></div>}
         {source.status === 'failed' && <div className="notice error"><AlertCircle size={16} />{t('Parser failed. The original Source remains preserved.')}</div>}
         {compile.isError && <div className="notice error"><span>{compile.error.message}</span><button onClick={() => compile.mutate(source.id)}>{t('Retry')}</button></div>}
         {compile.data && <div className="notice success"><span>{t('Compilation')} {compile.data.status}</span><Link to={`/compilation?run=${compile.data.run_id}`}>{t('Open run')}</Link></div>}

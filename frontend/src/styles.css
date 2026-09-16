@@ -38,6 +38,8 @@ a { color: inherit; text-decoration: none; }
 .view-tabs button { display: flex; align-items: center; gap: 7px; border: 0; border-bottom: 2px solid transparent; padding: 10px 12px; background: transparent; color: #66747d; cursor: pointer; }
 .view-tabs button.active { color: #075d67; border-color: #087f8c; }
 .page-summary { margin: 28px 0 36px; max-width: 760px; color: #46555d; font-size: 17px; line-height: 1.75; }
+.wiki-link { color: #08717d; text-decoration: underline; text-decoration-color: rgba(8,113,125,.45); text-underline-offset: 2px; text-decoration-thickness: 1px; font-weight: 500; cursor: pointer; }
+.wiki-link:hover { color: #0a8b99; text-decoration-color: currentColor; text-decoration-thickness: 2px; }
 .knowledge-section { margin-top: 30px; }
 .knowledge-section > h2, .relations > h2 { font-size: 17px; margin: 0 0 14px; }
 .claim { display: block; padding: 16px 0 18px; border-top: 1px solid #e2e7e9; }
@@ -151,6 +153,11 @@ a { color: inherit; text-decoration: none; }
 .detail-head p { margin: 0; color: var(--muted); font: 10px ui-monospace, monospace; overflow-wrap: anywhere; }
 .primary-command, .compile-control button, .upload-button { display: inline-flex; align-items: center; gap: 7px; min-height: 36px; padding: 0 13px; border: 0; background: var(--ink); color: #fff; font-size: 12px; cursor: pointer; }
 .primary-command:disabled, .upload-button.disabled { opacity: .5; cursor: default; }
+.detail-actions, .reader-actions { display: inline-flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.danger-command { display: inline-flex; align-items: center; gap: 7px; min-height: 36px; padding: 0 13px; border: 1px solid #d9534f; background: #fff; color: #c9302c; font-size: 12px; cursor: pointer; }
+.danger-command:disabled { opacity: .5; cursor: default; }
+.icon-button.danger { border-color: #e6b3b1; color: #c9302c; }
+.icon-button.danger:hover { background: #fbecec; }
 .upload-button input { display: none; }
 .compile-control { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .compile-control select, .provider-panel input, .compile-control button, .settings-page input { min-height: 36px; border: 1px solid var(--line); background: #fff; color: var(--ink); padding: 0 10px; font-size: 12px; }

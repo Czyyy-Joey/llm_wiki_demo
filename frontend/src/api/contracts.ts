@@ -20,6 +20,9 @@ export type SectionView = { section: { id: string; heading: string; summary: str
 export type LinkView = { link: { source_page_id: string; target_page_id: string; relation: string }; page: WikiPage }
 export type SourceTrace = { source: SourceDocument; chunk_count: number; claim_count: number; evidence: EvidenceView[] }
 export type WikiPageDetail = { page: WikiPage; canonical_page?: WikiPage; sections: SectionView[]; claims: ClaimView[]; links: LinkView[]; backlinks: LinkView[]; related: LinkView[]; sources: SourceTrace[] }
+export type GraphNode = { id: string; slug: string; title: string; page_type: PageType; summary: string; claim_count: number; source_count: number; link_count: number }
+export type GraphEdge = { source: string; target: string; relation: string }
+export type WikiGraph = { nodes: GraphNode[]; edges: GraphEdge[] }
 export type RevisionDiff = { added_claims: string[]; removed_claims: string[]; changed: string[] }
 export type RevisionView = { revision: { page_id: string; revision_number: number; compilation_run_id: string; change_summary: string; created_at: string }; diff: RevisionDiff }
 export type RetrievalCandidate = { passage_id: string; page_id: string; slug: string; title: string; page_type: string; text: string; fts_score: number; vector_score: number; rrf_score: number; expansion_score: number; final_score: number; expanded: boolean; expansion_from?: string[]; selected: boolean; discard_reason?: string }
@@ -118,6 +121,23 @@ export async function uploadSource(file: File): Promise<SourceUpload> {
   return await response.json() as SourceUpload
 }
 
+export async function deleteSource(id: string): Promise<{ deleted_pages: number; deleted_claims: number }> {
+  const response = await fetch(`/api/sources/${encodeURIComponent(id)}`, { method: 'DELETE', headers: scopedHeaders() })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as ErrorPayload | null
+    throw new Error(errorMessage(payload, `Delete failed: ${response.status}`))
+  }
+  return await response.json() as { deleted_pages: number; deleted_claims: number }
+}
+
+export async function deleteWikiPage(key: string): Promise<void> {
+  const response = await fetch(`/api/wiki/pages/${encodeURIComponent(key)}`, { method: 'DELETE', headers: scopedHeaders() })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as ErrorPayload | null
+    throw new Error(errorMessage(payload, `Delete failed: ${response.status}`))
+  }
+}
+
 export async function getSourceChunks(id: string): Promise<SourceChunk[]> {
   const response = await getJSON<{ chunks: SourceChunk[] }>(`/api/sources/${encodeURIComponent(id)}/chunks`)
   return response.chunks ?? []
@@ -141,6 +161,10 @@ export async function getWikiPages(pageType?: PageType): Promise<WikiPageListIte
 
 export function getWikiPage(slug: string): Promise<WikiPageDetail> {
   return getJSON<WikiPageDetail>(`/api/wiki/pages/${encodeURIComponent(slug)}`)
+}
+
+export function getWikiGraph(): Promise<WikiGraph> {
+  return getJSON<WikiGraph>('/api/wiki/graph')
 }
 
 export async function getWikiRevisions(slug: string): Promise<RevisionView[]> {

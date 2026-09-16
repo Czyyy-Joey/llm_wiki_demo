@@ -23,9 +23,14 @@ type PlanInput struct {
 	Analysis   json.RawMessage
 	Candidates json.RawMessage
 }
+type LinkInput struct {
+	Pages   json.RawMessage
+	Catalog json.RawMessage
+}
 type LLMClient interface {
 	Analyze(context.Context, AnalyzeInput) (json.RawMessage, error)
 	Plan(context.Context, PlanInput) (json.RawMessage, error)
+	SuggestLinks(context.Context, LinkInput) (json.RawMessage, error)
 }
 type EmbeddingClient interface {
 	Embed(context.Context, []string) ([][]float32, error)
@@ -171,6 +176,7 @@ func (DeterministicFake) Plan(ctx context.Context, input PlanInput) (json.RawMes
 	}
 	actions := make([]domain.PageAction, 0, len(analysis.Topics))
 	matched := make(map[string]domain.CompilationCandidate)
+	refByKey := make(map[string]string, len(analysis.Topics))
 	for _, topic := range analysis.Topics {
 		var match *domain.CompilationCandidate
 		var alternate *domain.CompilationCandidate
@@ -193,6 +199,9 @@ func (DeterministicFake) Plan(ctx context.Context, input PlanInput) (json.RawMes
 			action.Action = domain.ActionUpdate
 			action.TargetPageID = match.PageID
 			action.Reason = updateReason
+			refByKey[topic.Key] = match.PageID
+		} else {
+			refByKey[topic.Key] = topic.Slug
 		}
 		for _, claim := range topic.Claims {
 			duplicate := false
@@ -223,13 +232,49 @@ func (DeterministicFake) Plan(ctx context.Context, input PlanInput) (json.RawMes
 		}
 	}
 	for _, relation := range analysis.Relations {
-		source, sourceOK := matched[relation.Source]
-		target, targetOK := matched[relation.Target]
-		if sourceOK && targetOK && source.PageID != target.PageID {
-			actions = append(actions, domain.PageAction{Action: domain.ActionLink, SourcePageID: source.PageID, TargetPageID: target.PageID, Relation: relation.Relation, Reason: "link related existing knowledge pages"})
+		source, sourceOK := refByKey[relation.Source]
+		target, targetOK := refByKey[relation.Target]
+		if sourceOK && targetOK && source != target {
+			actions = append(actions, domain.PageAction{Action: domain.ActionLink, SourcePageID: source, TargetPageID: target, Relation: relation.Relation, Reason: "link related knowledge pages"})
 		}
 	}
 	return json.Marshal(domain.CompilationPlan{DocumentID: input.DocumentID, PageActions: actions, SchemaVersion: "phase2-v1"})
+}
+
+// linkPage is the page shape SuggestLinks consumes from both Pages and Catalog.
+type linkPage struct {
+	ID      string `json:"id"`
+	Title   string `json:"title"`
+	Summary string `json:"summary"`
+}
+
+// SuggestLinks proposes a relation whenever one page's title or summary mentions
+// another page's title. The heuristic is deterministic so tests are stable; the
+// real provider replaces it with model-judged relations.
+func (DeterministicFake) SuggestLinks(_ context.Context, input LinkInput) (json.RawMessage, error) {
+	var pages, catalog []linkPage
+	if err := json.Unmarshal(input.Pages, &pages); err != nil {
+		return nil, err
+	}
+	if len(input.Catalog) > 0 {
+		if err := json.Unmarshal(input.Catalog, &catalog); err != nil {
+			return nil, err
+		}
+	}
+	targets := append(append([]linkPage{}, pages...), catalog...)
+	suggestions := domain.LinkSuggestions{Links: []domain.LinkSuggestion{}}
+	for _, source := range pages {
+		haystack := source.Title + " " + source.Summary
+		for _, target := range targets {
+			if target.ID == source.ID || target.Title == "" {
+				continue
+			}
+			if strings.Contains(haystack, target.Title) {
+				suggestions.Links = append(suggestions.Links, domain.LinkSuggestion{SourcePageID: source.ID, TargetPageID: target.ID, Relation: "references", Reason: "source page mentions the target page title"})
+			}
+		}
+	}
+	return json.Marshal(suggestions)
 }
 
 func (DeterministicFake) Embed(_ context.Context, inputs []string) ([][]float32, error) {

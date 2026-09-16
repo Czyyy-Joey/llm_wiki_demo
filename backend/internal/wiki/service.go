@@ -159,6 +159,68 @@ func (s Service) GetPage(ctx context.Context, key string) (PageDetail, error) {
 	return PageDetail{Page: page, Sections: sections, Claims: claims, Links: links, Backlinks: backlinks, Related: related, Sources: sources}, nil
 }
 
+type GraphNode struct {
+	ID          string          `json:"id"`
+	Slug        string          `json:"slug"`
+	Title       string          `json:"title"`
+	PageType    domain.PageType `json:"page_type"`
+	Summary     string          `json:"summary"`
+	ClaimCount  int             `json:"claim_count"`
+	SourceCount int             `json:"source_count"`
+	LinkCount   int             `json:"link_count"`
+}
+
+type GraphEdge struct {
+	Source   string `json:"source"`
+	Target   string `json:"target"`
+	Relation string `json:"relation"`
+}
+
+type WikiGraph struct {
+	Nodes []GraphNode `json:"nodes"`
+	Edges []GraphEdge `json:"edges"`
+}
+
+// Graph returns every active Wiki page as a node and every link between two
+// active pages as a directed edge, scoped to the current knowledge base. Links
+// to non-active pages (e.g. merged_into) are excluded so the graph only shows
+// documents a reader can open.
+func (s Service) Graph(ctx context.Context) (WikiGraph, error) {
+	pages, err := s.ListPages(ctx, "")
+	if err != nil {
+		return WikiGraph{}, err
+	}
+	nodes := make([]GraphNode, 0, len(pages))
+	for _, page := range pages {
+		nodes = append(nodes, GraphNode{
+			ID: page.ID, Slug: page.Slug, Title: page.Title, PageType: page.PageType, Summary: page.Summary,
+			ClaimCount: page.ClaimCount, SourceCount: page.SourceCount, LinkCount: page.LinkCount,
+		})
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT l.source_page_id, l.target_page_id, l.relation
+		FROM wiki_links l
+		JOIN wiki_pages sp ON sp.id = l.source_page_id AND sp.status = 'active' AND sp.knowledge_base_id = l.knowledge_base_id
+		JOIN wiki_pages tp ON tp.id = l.target_page_id AND tp.status = 'active' AND tp.knowledge_base_id = l.knowledge_base_id
+		WHERE l.knowledge_base_id = ? AND l.relation != 'merged_into'
+		ORDER BY l.source_page_id, l.target_page_id, l.relation`, s.scope(ctx))
+	if err != nil {
+		return WikiGraph{}, err
+	}
+	defer rows.Close()
+	edges := make([]GraphEdge, 0)
+	for rows.Next() {
+		var edge GraphEdge
+		if err := rows.Scan(&edge.Source, &edge.Target, &edge.Relation); err != nil {
+			return WikiGraph{}, err
+		}
+		edges = append(edges, edge)
+	}
+	if err := rows.Err(); err != nil {
+		return WikiGraph{}, err
+	}
+	return WikiGraph{Nodes: nodes, Edges: edges}, nil
+}
+
 func (s Service) SourceTrace(ctx context.Context, documentID string) (SourceTrace, error) {
 	var source domain.SourceDocument
 	var created string
