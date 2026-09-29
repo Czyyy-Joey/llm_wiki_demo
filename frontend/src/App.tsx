@@ -1,8 +1,9 @@
-import { Activity, BookOpen, Boxes, FileArchive, FileCode2, MessageCircle, Search as SearchIcon, Settings as SettingsIcon, Sparkles } from 'lucide-react'
+import { Activity, BookOpen, Boxes, FileArchive, FileCode2, MessageCircle, Search as SearchIcon, Settings as SettingsIcon, Share2, Sparkles } from 'lucide-react'
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { ChatPanel } from './features/chat/ChatPanel'
 import { CompilationPanel } from './features/compilation/CompilationPanel'
+import { KnowledgeGraph } from './features/graph/KnowledgeGraph'
 import { QueryPanel } from './features/query/QueryPanel'
 import { SearchPanel } from './features/search/SearchPanel'
 import { SettingsPanel } from './features/settings/SettingsPanel'
@@ -14,7 +15,7 @@ import { useWorkspace } from './workspace'
 import './styles.css'
 
 const navigation = [
-  { to: '/wiki', label: 'Wiki', icon: BookOpen }, { to: '/sources', label: 'Sources', icon: FileArchive }, { to: '/compilation', label: 'Compilation', icon: Boxes },
+  { to: '/wiki', label: 'Wiki', icon: BookOpen }, { to: '/graph', label: 'Graph', icon: Share2 }, { to: '/sources', label: 'Sources', icon: FileArchive }, { to: '/compilation', label: 'Compilation', icon: Boxes },
   { to: '/search', label: 'Search', icon: SearchIcon }, { to: '/query', label: 'Query', icon: Sparkles }, { to: '/chat', label: 'Chat', icon: MessageCircle }, { to: '/settings', label: 'Settings', icon: SettingsIcon },
 ]
 
@@ -26,5 +27,5 @@ function Layout({ children }: { children: React.ReactNode }) {
 }
 
 export function App() {
-  return <Layout><Routes><Route path="/wiki/:slug?" element={<WikiBrowser />} /><Route path="/sources" element={<SourcesPanel />} /><Route path="/compilation" element={<CompilationPanel />} /><Route path="/search" element={<SearchPanel />} /><Route path="/query" element={<QueryPanel />} /><Route path="/chat" element={<ChatPanel />} /><Route path="/settings" element={<SettingsPanel />} /><Route path="/" element={<Navigate to="/wiki" replace />} /><Route path="*" element={<Navigate to="/wiki" replace />} /></Routes></Layout>
+  return <Layout><Routes><Route path="/wiki/:slug?" element={<WikiBrowser />} /><Route path="/graph" element={<KnowledgeGraph />} /><Route path="/sources" element={<SourcesPanel />} /><Route path="/compilation" element={<CompilationPanel />} /><Route path="/search" element={<SearchPanel />} /><Route path="/query" element={<QueryPanel />} /><Route path="/chat" element={<ChatPanel />} /><Route path="/settings" element={<SettingsPanel />} /><Route path="/" element={<Navigate to="/wiki" replace />} /><Route path="*" element={<Navigate to="/wiki" replace />} /></Routes></Layout>
 }

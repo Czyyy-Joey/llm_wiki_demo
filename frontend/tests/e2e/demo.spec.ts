@@ -15,13 +15,13 @@ They add indexing strategies for efficient nearest-neighbor search.
 `
 
 async function upload(page: Page, name: string, body: string) {
-  await page.locator('input[type=file]').setInputFiles({
+  await page.locator('input[type=file]').first().setInputFiles({
     name,
     mimeType: 'text/markdown',
     buffer: Buffer.from(body),
   })
   await expect(page.getByText(`${name}`, { exact: true }).first()).toBeVisible()
-  await expect(page.getByText('stable chunks parsed.')).toBeVisible()
+  await expect(page.getByText('1 uploaded')).toBeVisible()
 }
 
 async function compileSelected(page: Page, expectedAction: 'CREATE' | 'UPDATE') {

@@ -121,6 +121,33 @@ export async function uploadSource(file: File): Promise<SourceUpload> {
   return await response.json() as SourceUpload
 }
 
+export type BatchUploadProgress = { total: number; done: number; currentName: string }
+export type BatchUploadResult = { succeeded: SourceUpload[]; failed: { name: string; message: string }[] }
+
+// uploadSources ingests files one at a time over the single-file endpoint so each
+// keeps its own dedup result and a failed file never aborts the rest of the batch.
+export async function uploadSources(files: File[], onProgress?: (progress: BatchUploadProgress) => void): Promise<BatchUploadResult> {
+  const succeeded: SourceUpload[] = []
+  const failed: { name: string; message: string }[] = []
+  for (let index = 0; index < files.length; index++) {
+    const file = files[index]
+    const name = fileLabel(file)
+    onProgress?.({ total: files.length, done: index, currentName: name })
+    try {
+      succeeded.push(await uploadSource(file))
+    } catch (error) {
+      failed.push({ name, message: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  onProgress?.({ total: files.length, done: files.length, currentName: '' })
+  return { succeeded, failed }
+}
+
+function fileLabel(file: File): string {
+  const relative = (file as File & { webkitRelativePath?: string }).webkitRelativePath
+  return relative && relative.length > 0 ? relative : file.name
+}
+
 export async function deleteSource(id: string): Promise<{ deleted_pages: number; deleted_claims: number }> {
   const response = await fetch(`/api/sources/${encodeURIComponent(id)}`, { method: 'DELETE', headers: scopedHeaders() })
   if (!response.ok) {
@@ -128,6 +155,10 @@ export async function deleteSource(id: string): Promise<{ deleted_pages: number;
     throw new Error(errorMessage(payload, `Delete failed: ${response.status}`))
   }
   return await response.json() as { deleted_pages: number; deleted_claims: number }
+}
+
+export function deleteSources(ids: string[]): Promise<{ deleted_sources: number; deleted_pages: number; deleted_claims: number }> {
+  return postJSON('/api/sources/delete', { ids })
 }
 
 export async function deleteWikiPage(key: string): Promise<void> {

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	appdb "github.com/joeychen/llm-wiki-demo/backend/internal/db"
 	"github.com/joeychen/llm-wiki-demo/backend/internal/domain"
@@ -770,6 +771,63 @@ func TestDeleteSourceRemovesExclusivePagesAndKeepsShared(t *testing.T) {
 	}
 }
 
+func TestDeleteSourcesRemovesEveryRequestedSource(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := appdb.Open(ctx, "file:"+filepath.Join(root, "app.db")+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	sourceService := sources.Service{DB: database, DataRoot: root}
+	sourceA, err := sourceService.Ingest(ctx, sources.IngestInput{OriginalName: "a.txt", MediaType: "text/plain", Data: []byte("alpha source evidence")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceB, err := sourceService.Ingest(ctx, sources.IngestInput{OriginalName: "b.txt", MediaType: "text/plain", Data: []byte("beta source evidence")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := func(query string, args ...any) {
+		if _, err := database.Exec(query, args...); err != nil {
+			t.Fatalf("setup exec failed: %v\n%s", err, query)
+		}
+	}
+	exec(`INSERT INTO compilation_runs (id, document_id, status, created_at) VALUES ('run_a', ?, 'applied', '2024-01-01T00:00:00Z')`, sourceA.Document.ID)
+	exec(`INSERT INTO compilation_runs (id, document_id, status, created_at) VALUES ('run_b', ?, 'applied', '2024-01-02T00:00:00Z')`, sourceB.Document.ID)
+	for _, p := range []struct{ id, slug, run, chunk string }{{"page_a", "page-a", "run_a", sourceA.Chunks[0].ID}, {"page_b", "page-b", "run_b", sourceB.Chunks[0].ID}} {
+		exec(`INSERT INTO wiki_pages (id, slug, page_type, title, summary, status, current_revision, created_at, updated_at) VALUES (?, ?, 'concept', ?, 'summary', 'active', 0, ?, ?)`, p.id, p.slug, p.slug, "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z")
+		exec(`INSERT INTO wiki_claims (id, page_id, text, claim_type, status, created_by_run_id, updated_by_run_id) VALUES (?, ?, 'claim text', 'fact', 'active', ?, ?)`, p.id+"_claim", p.id, p.run, p.run)
+		exec(`INSERT INTO claim_evidence (claim_id, source_chunk_id, relation) VALUES (?, ?, 'supports')`, p.id+"_claim", p.chunk)
+	}
+
+	service := Service{DB: database, DataRoot: root, LLM: llm.DeterministicFake{}}
+	summary, err := service.DeleteSources(ctx, []string{sourceA.Document.ID, sourceB.Document.ID})
+	if err != nil {
+		t.Fatalf("DeleteSources failed: %v", err)
+	}
+	if summary.DeletedSources != 2 || summary.DeletedPages != 2 || summary.DeletedClaims != 2 {
+		t.Fatalf("summary = %+v, want 2 sources / 2 pages / 2 claims", summary)
+	}
+	var remaining int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM source_documents`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("sources should all be deleted, %d remain", remaining)
+	}
+	if err := database.QueryRow(`SELECT COUNT(*) FROM wiki_pages`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("pages should all be deleted, %d remain", remaining)
+	}
+
+	if _, err := service.DeleteSources(ctx, nil); err == nil {
+		t.Fatal("DeleteSources with no ids should error")
+	}
+}
+
 func TestDeletePageRemovesPageClaimsAndLinks(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -827,7 +885,6 @@ func TestDeletePageRemovesPageClaimsAndLinks(t *testing.T) {
 	}
 }
 
-
 func TestPluralTypeUsesEntities(t *testing.T) {
 	cases := map[domain.PageType]string{domain.PageTypeConcept: "concepts", domain.PageTypeEntity: "entities", domain.PageTypeTopic: "topics"}
 	for pt, want := range cases {
@@ -849,5 +906,130 @@ func TestLinkifyMarkdownEmbedsInlineLinks(t *testing.T) {
 	}
 	if linkifyMarkdown("暖橙面包店", nil) != "暖橙面包店" {
 		t.Fatal("nil connections must leave text unchanged")
+	}
+}
+
+func TestLinkMentionsConnectsUnrelatedPages(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := appdb.Open(ctx, "file:"+filepath.Join(root, "app.db")+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	sourceService := sources.Service{DB: database, DataRoot: root}
+	source, err := sourceService.Ingest(ctx, sources.IngestInput{OriginalName: "mentions.txt", MediaType: "text/plain", Data: []byte("evidence for mentions")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO compilation_runs (id, document_id, status, created_at) VALUES ('run_mentions', ?, 'applied', '2024-01-01T00:00:00Z')`, source.Document.ID); err != nil {
+		t.Fatal(err)
+	}
+	// moving-plan's summary names 林然, but no wiki_link connects them.
+	for _, page := range []struct{ id, slug, ptype, title, summary string }{
+		{"page_lin", "lin-ran", "entity", "林然", "林然是这次搬家的负责人。"},
+		{"page_move", "moving-plan", "topic", "搬家计划", "本计划由林然牵头执行。"},
+	} {
+		if _, err := database.Exec(`INSERT INTO wiki_pages (id, slug, page_type, title, summary, status, current_revision, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)`, page.id, page.slug, page.ptype, page.title, page.summary, "2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := Service{DB: database, DataRoot: root}
+	added, err := service.linkMentions(ctx, "run_mentions")
+	if err != nil {
+		t.Fatalf("linkMentions failed: %v", err)
+	}
+	if added != 1 {
+		t.Fatalf("added = %d, want 1", added)
+	}
+	var count int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM wiki_links WHERE source_page_id = 'page_move' AND target_page_id = 'page_lin' AND relation = 'references'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("mention link count = %d, want 1", count)
+	}
+	// A page must never link its own title to itself.
+	if err := database.QueryRow(`SELECT COUNT(*) FROM wiki_links WHERE source_page_id = target_page_id`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("self links = %d, want 0", count)
+	}
+	// Idempotent: the pair is already connected, so a second pass adds nothing and
+	// never inserts a redundant reverse edge.
+	again, err := service.linkMentions(ctx, "run_mentions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != 0 {
+		t.Fatalf("second linkMentions added %d links, want 0", again)
+	}
+}
+
+func TestCompileGateSerializesPerKnowledgeBase(t *testing.T) {
+	gateA := compileGate("gate-kb-a")
+	if compileGate("gate-kb-a") != gateA {
+		t.Fatal("expected the same gate for the same knowledge base")
+	}
+	if compileGate("gate-kb-b") == gateA {
+		t.Fatal("expected distinct gates for different knowledge bases")
+	}
+
+	gateA <- struct{}{} // hold the gate for kb-a
+	acquired := make(chan struct{})
+	go func() {
+		gateA <- struct{}{}
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second acquisition proceeded while the gate was held")
+	case <-time.After(50 * time.Millisecond):
+	}
+	// A different knowledge base must not be blocked by kb-a's held gate.
+	select {
+	case compileGate("gate-kb-b") <- struct{}{}:
+		<-compileGate("gate-kb-b")
+	default:
+		t.Fatal("a different knowledge base should acquire its own gate immediately")
+	}
+	<-gateA // release kb-a
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("second acquisition did not proceed after release")
+	}
+	<-gateA // clean up the goroutine's acquisition
+}
+
+func TestCompileWaitsOnGateAndHonorsCancellation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	database, err := appdb.Open(ctx, "file:"+filepath.Join(root, "app.db")+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	service := Service{DB: database, DataRoot: root, LLM: llm.DeterministicFake{}, KnowledgeBaseID: "gate-cancel-kb"}
+
+	gate := compileGate(service.scope(ctx))
+	gate <- struct{}{} // simulate a compile already running for this knowledge base
+	defer func() { <-gate }()
+
+	cancelledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.Compile(cancelledCtx, "any-document")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Compile err = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Compile did not return while the knowledge base gate was held; it is not waiting on the gate")
 	}
 }

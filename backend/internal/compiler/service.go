@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -47,6 +48,28 @@ func (s Service) scope(ctx context.Context) string {
 	return knowledgebase.Scope(ctx, s.KnowledgeBaseID)
 }
 
+// compileGates serializes compilation within a single knowledge base. The
+// analyze→match→plan→validate→apply pipeline spans many separate statements and
+// LLM calls, so overlapping runs for the same knowledge base race on checks like
+// slug uniqueness. The Service struct is rebuilt per request, so the registry
+// must live at package scope to be shared across requests; different knowledge
+// bases keep independent gates and still run in parallel.
+var (
+	compileGatesMu sync.Mutex
+	compileGates   = map[string]chan struct{}{}
+)
+
+func compileGate(knowledgeBaseID string) chan struct{} {
+	compileGatesMu.Lock()
+	defer compileGatesMu.Unlock()
+	gate, ok := compileGates[knowledgeBaseID]
+	if !ok {
+		gate = make(chan struct{}, 1)
+		compileGates[knowledgeBaseID] = gate
+	}
+	return gate
+}
+
 type Result struct {
 	RunID  string `json:"run_id"`
 	Status string `json:"status"`
@@ -70,9 +93,9 @@ type Run struct {
 
 func (s Service) Compile(ctx context.Context, documentID string) (Result, error) {
 	ctx = llm.WithLanguage(ctx, s.Language)
+	scope := s.scope(ctx)
 	started := time.Now()
 	stage := "load_source"
-	logging.Logger(ctx).Info("compilation started", "document_id", documentID)
 	doc, err := s.loadDocument(ctx, documentID)
 	if err != nil {
 		return Result{}, err
@@ -84,21 +107,50 @@ func (s Service) Compile(ctx context.Context, documentID string) (Result, error)
 	if doc.Status != "parsed" || len(chunks) == 0 {
 		return Result{}, fmt.Errorf("source %s is not parsed", documentID)
 	}
-	runID := newID("run", s.scope(ctx)+documentID+time.Now().UTC().Format(time.RFC3339Nano))
-	created := time.Now().UTC()
 	client := s.LLM
 	if client == nil {
 		return Result{}, errors.New("compiler LLM is not configured; configure COMPILER_LLM_* or explicitly enable the development fake")
 	}
+	// Content dedup + coalesce keyed on the source's latest run. The document ID is
+	// derived from the source content hash, so an applied or render-pending run means
+	// this exact content is already compiled, and any non-terminal run means it is
+	// already queued or running — either way return that run instead of compiling
+	// again. Only a failed last run is recompiled.
+	var lastID, lastStatus string
+	switch scanErr := s.DB.QueryRowContext(ctx, `SELECT id, status FROM compilation_runs WHERE document_id = ? AND knowledge_base_id = ? ORDER BY created_at DESC LIMIT 1`, documentID, scope).Scan(&lastID, &lastStatus); scanErr {
+	case nil:
+		if lastStatus != RunFailed {
+			return Result{RunID: lastID, Status: lastStatus}, nil
+		}
+	case sql.ErrNoRows:
+	default:
+		return Result{}, scanErr
+	}
+	runID := newID("run", scope+documentID+time.Now().UTC().Format(time.RFC3339Nano))
 	model := "configured-client"
 	if named, ok := client.(interface{ Name() string }); ok {
 		model = named.Name()
 	}
-	if _, err = s.DB.ExecContext(ctx, `INSERT INTO compilation_runs (id, knowledge_base_id, document_id, status, model, prompt_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, runID, s.scope(ctx), documentID, RunPending, model, "phase2-v2", created.Format(time.RFC3339Nano)); err != nil {
+	// Record the run as pending before waiting on the gate so a queued compilation
+	// is visible immediately (e.g. on the compilation page) while an earlier run for
+	// the same knowledge base is still in progress, instead of only once it starts.
+	if _, err = s.DB.ExecContext(ctx, `INSERT INTO compilation_runs (id, knowledge_base_id, document_id, status, model, prompt_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, runID, scope, documentID, RunPending, model, "phase2-v2", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return Result{}, err
 	}
+	logging.Logger(ctx).Info("compilation queued", "run_id", runID, "document_id", documentID)
+	// Serialize compilation per knowledge base. If the client disconnects while
+	// queued, mark the pending run failed so it does not linger as a stuck row.
+	gate := compileGate(scope)
+	select {
+	case gate <- struct{}{}:
+		defer func() { <-gate }()
+	case <-ctx.Done():
+		_, _ = s.DB.ExecContext(context.Background(), `UPDATE compilation_runs SET status = ?, error = ? WHERE id = ? AND knowledge_base_id = ?`, RunFailed, ctx.Err().Error(), runID, scope)
+		return Result{RunID: runID, Status: RunFailed}, ctx.Err()
+	}
+	logging.Logger(ctx).Info("compilation started", "run_id", runID, "document_id", documentID)
 	fail := func(cause error) (Result, error) {
-		_, _ = s.DB.ExecContext(ctx, `UPDATE compilation_runs SET status = ?, error = ? WHERE id = ? AND knowledge_base_id = ?`, RunFailed, cause.Error(), runID, s.scope(ctx))
+		_, _ = s.DB.ExecContext(ctx, `UPDATE compilation_runs SET status = ?, error = ? WHERE id = ? AND knowledge_base_id = ?`, RunFailed, cause.Error(), runID, scope)
 		logging.Logger(ctx).Error("compilation failed", "run_id", runID, "document_id", documentID, "stage", stage, "status", RunFailed, "duration_ms", logging.Duration(started), "error", logging.SafeDetail(cause))
 		return Result{RunID: runID, Status: RunFailed}, cause
 	}
@@ -187,6 +239,13 @@ func (s Service) Compile(ctx context.Context, documentID string) (Result, error)
 		logging.Logger(ctx).Error("cross-page relate failed", "run_id", runID, "error", logging.SafeSummary(relateErr))
 	} else if related > 0 {
 		logging.Logger(ctx).Info("cross-page relate completed", "run_id", runID, "links_added", related)
+	}
+	// Deterministic backstop: link plain title mentions the relate step missed so
+	// they exist as data and are reachable through retrieval link expansion.
+	if mentioned, mentionErr := s.linkMentions(ctx, runID); mentionErr != nil {
+		logging.Logger(ctx).Error("mention linking failed", "run_id", runID, "error", logging.SafeSummary(mentionErr))
+	} else if mentioned > 0 {
+		logging.Logger(ctx).Info("mention linking completed", "run_id", runID, "links_added", mentioned)
 	}
 	return Result{RunID: runID, Status: RunApplied}, nil
 }
@@ -1012,13 +1071,99 @@ func (s Service) Relink(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return s.RelateAll(ctx, runID)
+	related, err := s.RelateAll(ctx, runID)
+	if err != nil {
+		return related, err
+	}
+	mentioned, err := s.linkMentions(ctx, runID)
+	return related + mentioned, err
+}
+
+// linkMentions is the deterministic backstop for missing links. It scans every
+// active page's compiled text (summary and claims) for exact mentions of other
+// active pages' titles and records a `references` wiki_link for each. Because the
+// link is stored as data — not merely rendered as a [[..]] at display time — it
+// feeds retrieval's 1-hop link expansion, the graph, and backlinks, so a named
+// subject that owns its own page is reachable in search wherever it is mentioned,
+// even when the LLM relate step never proposed the relation. Pairs already
+// connected in either direction keep their more specific relation and are skipped.
+// It re-renders the projection when it adds links and returns the number added.
+func (s Service) linkMentions(ctx context.Context, runID string) (int, error) {
+	pages, claims, _, err := s.loadWikiState(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(pages) < 2 {
+		return 0, nil
+	}
+	textByPage := make(map[string]string, len(pages))
+	for _, page := range pages {
+		textByPage[page.ID] = page.Summary
+	}
+	for _, claim := range claims {
+		if claim.Status == "active" || claim.Status == "disputed" {
+			textByPage[claim.PageID] += "\n" + claim.Text
+		}
+	}
+	existing, err := s.loadWikiLinks(ctx)
+	if err != nil {
+		return 0, err
+	}
+	connected := make(map[string]bool, len(existing))
+	pairKey := func(a, b string) string { return a + "\x00" + b }
+	for _, link := range existing {
+		connected[pairKey(link.SourcePageID, link.TargetPageID)] = true
+		connected[pairKey(link.TargetPageID, link.SourcePageID)] = true
+	}
+	// Match longer titles first so a title that contains a shorter one resolves to
+	// the most specific page and nested titles are not double-counted.
+	ordered := append([]domain.WikiPage(nil), pages...)
+	sort.Slice(ordered, func(i, j int) bool { return len([]rune(ordered[i].Title)) > len([]rune(ordered[j].Title)) })
+	added := 0
+	for _, source := range pages {
+		text := textByPage[source.ID]
+		if text == "" {
+			continue
+		}
+		for _, target := range ordered {
+			if target.ID == source.ID || target.Title == "" {
+				continue
+			}
+			if connected[pairKey(source.ID, target.ID)] || connected[pairKey(target.ID, source.ID)] {
+				continue
+			}
+			if !strings.Contains(text, target.Title) {
+				continue
+			}
+			result, err := s.DB.ExecContext(ctx, `INSERT OR IGNORE INTO wiki_links (source_page_id, target_page_id, relation, created_by_run_id, knowledge_base_id) VALUES (?, ?, 'references', ?, ?)`, source.ID, target.ID, runID, s.scope(ctx))
+			if err != nil {
+				return added, err
+			}
+			connected[pairKey(source.ID, target.ID)] = true
+			connected[pairKey(target.ID, source.ID)] = true
+			if n, _ := result.RowsAffected(); n > 0 {
+				added++
+			}
+		}
+	}
+	if added > 0 {
+		if err := s.renderDefaultProjection(ctx); err != nil {
+			return added, err
+		}
+	}
+	return added, nil
 }
 
 // DeleteSummary reports what a source deletion removed.
 type DeleteSummary struct {
 	DeletedPages  int `json:"deleted_pages"`
 	DeletedClaims int `json:"deleted_claims"`
+}
+
+type BatchDeleteSummary struct {
+	DeletedSources int `json:"deleted_sources"`
+	DeletedPages   int `json:"deleted_pages"`
+	DeletedClaims  int `json:"deleted_claims"`
 }
 
 func inClause(ids []string) (string, []any) {
@@ -1060,6 +1205,47 @@ func scanIDsTx(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]st
 // original and parsed files, rebuilds the Wiki projection, reindexes, and
 // rebuilds cross-page links. Returns sql.ErrNoRows if the source is unknown.
 func (s Service) DeleteSource(ctx context.Context, documentID string) (DeleteSummary, error) {
+	summary, err := s.deleteSourceRows(ctx, documentID)
+	if err != nil {
+		return DeleteSummary{}, err
+	}
+	s.rebuildAfterDelete(ctx)
+	return summary, nil
+}
+
+// DeleteSources removes several sources in one call and rebuilds the Wiki
+// projection, index, and links only once afterward instead of per source.
+// Sources are deleted in order; on the first failure it stops, rebuilds for
+// whatever committed, and returns the accumulated counts alongside the error.
+// Returns sql.ErrNoRows if the first unknown source is reached before any
+// deletion succeeds.
+func (s Service) DeleteSources(ctx context.Context, documentIDs []string) (BatchDeleteSummary, error) {
+	if len(documentIDs) == 0 {
+		return BatchDeleteSummary{}, fmt.Errorf("no source ids provided")
+	}
+	summary := BatchDeleteSummary{}
+	var failure error
+	for _, documentID := range documentIDs {
+		rows, err := s.deleteSourceRows(ctx, documentID)
+		if err != nil {
+			failure = err
+			break
+		}
+		summary.DeletedSources++
+		summary.DeletedPages += rows.DeletedPages
+		summary.DeletedClaims += rows.DeletedClaims
+	}
+	if summary.DeletedSources > 0 {
+		s.rebuildAfterDelete(ctx)
+	}
+	return summary, failure
+}
+
+// deleteSourceRows performs the transactional deletion of a single source and
+// its exclusively-derived Wiki rows, plus the source's on-disk files. It does
+// not re-render, reindex, or relink; callers do that once via rebuildAfterDelete
+// so batch deletes pay the rebuild cost a single time.
+func (s Service) deleteSourceRows(ctx context.Context, documentID string) (DeleteSummary, error) {
 	scope := s.scope(ctx)
 	var originalPath, parsedPath string
 	if err := s.DB.QueryRowContext(ctx, `SELECT original_path, COALESCE(parsed_path, '') FROM source_documents WHERE id = ? AND knowledge_base_id = ?`, documentID, scope).Scan(&originalPath, &parsedPath); err != nil {
@@ -1092,7 +1278,6 @@ func (s Service) DeleteSource(ctx context.Context, documentID string) (DeleteSum
 	if err != nil {
 		return DeleteSummary{}, err
 	}
-	// SENTINEL_DELETE_SOURCE_PART2
 	deleteSet := make(map[string]bool, len(claimsToDelete))
 	for _, id := range claimsToDelete {
 		deleteSet[id] = true
@@ -1160,19 +1345,24 @@ func (s Service) DeleteSource(ctx context.Context, documentID string) (DeleteSum
 	if parsedPath != "" {
 		_ = os.Remove(parsedPath)
 	}
-	summary := DeleteSummary{DeletedPages: len(pagesToDelete), DeletedClaims: len(claimsToDelete)}
+	return DeleteSummary{DeletedPages: len(pagesToDelete), DeletedClaims: len(claimsToDelete)}, nil
+}
+
+// rebuildAfterDelete re-renders the Markdown projection, reindexes, and rebuilds
+// cross-page links after one or more sources have been removed. Failures are
+// logged but not fatal: the deletion already committed.
+func (s Service) rebuildAfterDelete(ctx context.Context) {
 	if err := s.renderDefaultProjection(ctx); err != nil {
-		logging.Logger(ctx).Error("re-render after source delete failed", "document_id", documentID, "error", logging.SafeSummary(err))
+		logging.Logger(ctx).Error("re-render after source delete failed", "error", logging.SafeSummary(err))
 	}
 	if s.Index != nil {
 		if _, err := s.Index.Reindex(ctx); err != nil {
-			logging.Logger(ctx).Error("reindex after source delete failed", "document_id", documentID, "error", logging.SafeSummary(err))
+			logging.Logger(ctx).Error("reindex after source delete failed", "error", logging.SafeSummary(err))
 		}
 	}
 	if _, err := s.Relink(ctx); err != nil {
-		logging.Logger(ctx).Error("relink after source delete failed", "document_id", documentID, "error", logging.SafeSummary(err))
+		logging.Logger(ctx).Error("relink after source delete failed", "error", logging.SafeSummary(err))
 	}
-	return summary, nil
 }
 
 func concatArgs(groups ...[]any) []any {
@@ -1229,8 +1419,6 @@ func (s Service) DeletePage(ctx context.Context, key string) error {
 	}
 	return nil
 }
-
-
 
 func validRelation(value string) bool {
 	switch value {
@@ -1458,6 +1646,8 @@ func renderMarkdownFiles(outputDir string, pages []domain.WikiPage, claims []dom
 	}
 	// Connected pages per page (both directions) drive inline [[slug|title]] links
 	// woven into the prose, so a mention like "暖橙面包店" is a link in the body.
+	// The edges come from wiki_links, which linkMentions backfills for plain title
+	// mentions, so display and the searchable link graph stay in sync.
 	connectionsByPage := map[string][]pageRef{}
 	seenConn := map[string]map[string]bool{}
 	addConn := func(pageID, otherID string) {

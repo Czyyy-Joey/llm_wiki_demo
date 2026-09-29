@@ -117,6 +117,7 @@ func (s *Server) Router() http.Handler {
 	r.Post("/api/knowledge-bases/{id}/archive", s.archiveKnowledgeBase)
 	r.Put("/api/config/settings", s.updateSettings)
 	r.Post("/api/sources", s.uploadSource)
+	r.Post("/api/sources/delete", s.deleteSources)
 	r.Get("/api/sources", s.listSources)
 	r.Get("/api/source-chunks/{id}", s.getSourceChunk)
 	r.Get("/api/sources/{id}", s.getSource)
@@ -353,6 +354,29 @@ func (s *Server) deleteSource(w http.ResponseWriter, r *http.Request) {
 	summary, err := runtime.Compiler.DeleteSource(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusNotFound, fmt.Errorf("source not found"))
+			return
+		}
+		writeJSONError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, summary)
+}
+
+type deleteSourcesRequest struct {
+	IDs []string `json:"ids"`
+}
+
+func (s *Server) deleteSources(w http.ResponseWriter, r *http.Request) {
+	var request deleteSourcesRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil || len(request.IDs) == 0 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Errorf("ids is required"))
+		return
+	}
+	runtime, _ := runtimeFromContext(r.Context())
+	summary, err := runtime.Compiler.DeleteSources(r.Context(), request.IDs)
+	if err != nil {
+		if err == sql.ErrNoRows && summary.DeletedSources == 0 {
 			writeJSONError(w, http.StatusNotFound, fmt.Errorf("source not found"))
 			return
 		}

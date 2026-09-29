@@ -73,6 +73,15 @@ export function WikiBrowser() {
     if (!slug && pages.data?.[0]) navigate(`/wiki/${pages.data[0].slug}`, { replace: true })
   }, [navigate, pages.data, slug])
 
+  // A page deleted elsewhere (e.g. its source removed) still sits in the URL and
+  // its detail query 404s. Redirect to another active page instead of leaving the
+  // reader on stale content. Inactive/merged pages return 200 and are unaffected.
+  useEffect(() => {
+    if (!slug || !detail.isError || !pages.data) return
+    const next = pages.data.find(page => page.slug !== slug)
+    navigate(next ? `/wiki/${next.slug}` : '/wiki', { replace: true })
+  }, [detail.isError, navigate, pages.data, slug])
+
   useEffect(() => {
     const citationID = searchParams.get('citation')
     if (!citationID || !detail.data) return
